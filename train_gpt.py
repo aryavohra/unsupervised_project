@@ -1484,17 +1484,28 @@ class CausalSelfAttention(nn.Module):
             numer = (y_f * v_f).sum(dim=-1, keepdim=True)
             denom = v_f.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
             y = (y_f - args.model_xsa_lambda * (numer / denom) * v_f).to(y.dtype)
-        elif args.xsa_mode == "output-metric-diag" and not self.paired:
-            y_f = y.float()
-            v_f = v.float()
-            wo_w = qkvo_w[self.dim * 3:].float()
-            metric_diag = wo_w.square().sum(dim=0).view(1, 1, self.num_heads, self.head_dim)
-            if args.output_metric_detach:
-                metric_diag = metric_diag.detach()
-            weighted_v = metric_diag * v_f
-            numer = (y_f * weighted_v).sum(dim=-1, keepdim=True)
-            denom = (v_f * weighted_v).sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            y = (y_f - args.model_xsa_lambda * (numer / denom) * v_f).to(y.dtype)
+        elif args.xsa_mode == "output-metric-diag" and attn_args.xsa_alpha is not None and not self.paired:
+            if args.output_metric_detach and args.output_metric_bf16_projection:
+                with torch.no_grad():
+                    metric_diag = qkvo_w[self.dim * 3:].float().square().sum(dim=0)
+                    metric_diag = metric_diag.view(1, 1, self.num_heads, self.head_dim).to(y.dtype)
+                weighted_v = metric_diag * v
+                numer = (y * weighted_v).sum(dim=-1, keepdim=True)
+                denom = (v * weighted_v).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
+                y = y - alpha * (numer / denom) * v
+            else:
+                y_f = y.float()
+                v_f = v.float()
+                metric_diag = qkvo_w[self.dim * 3:].float().square().sum(dim=0)
+                metric_diag = metric_diag.view(1, 1, self.num_heads, self.head_dim)
+                if args.output_metric_detach:
+                    metric_diag = metric_diag.detach()
+                weighted_v = metric_diag * v_f
+                numer = (y_f * weighted_v).sum(dim=-1, keepdim=True)
+                denom = (v_f * weighted_v).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                alpha = torch.tanh(attn_args.xsa_alpha).float().view(1, 1, self.num_heads, 1)
+                y = (y_f - alpha * (numer / denom) * v_f).to(y.dtype)
         y_post_head_xsa = y
         attn_gate = torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y_gated = y * attn_gate
@@ -1735,10 +1746,9 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
-        # Upstream learnable XSA on non-paired attn layers only; paired {0,2,5,9} and MLP-only layer 6 skipped.
-        # Alternative experimental XSA modes are selected inside attention and do not use learned alphas.
+        # Learnable XSA strengths are available to modes that use upstream's per-head tanh(alpha) weighting.
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
-        if args.xsa_mode == "record":
+        if args.xsa_mode in {"record", "output-metric-diag"}:
             xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
         else:
             xsa_alphas = [None] * self.num_layers
@@ -2072,6 +2082,7 @@ class Hyperparameters:
     xsa_mode: str = os.environ.get("XSA_MODE", "record").replace("_", "-")
     model_xsa_lambda: float = float(os.environ.get("MODEL_XSA_LAMBDA", "1.0"))
     output_metric_detach: bool = os.environ.get("OUTPUT_METRIC_DETACH", "0").lower() in ("1", "true", "yes")
+    output_metric_bf16_projection: bool = os.environ.get("OUTPUT_METRIC_BF16_PROJECTION", "0").lower() in ("1", "true", "yes")
     xsa_interp: bool = os.environ.get("XSA_INTERP", "0").lower() in ("1", "true", "yes")
     xsa_interp_tests: tuple[str, ...] = tuple(s for s in os.environ.get("XSA_INTERP_TESTS", "alignment").replace(",", " ").split())
     xsa_interp_modes: tuple[str, ...] = tuple(s.replace("_", "-") for s in os.environ.get(
@@ -2108,6 +2119,10 @@ def apply_cli_overrides(args: Hyperparameters):
                         help="Treat output-metric diagonals as fixed in output-metric-diag backward.")
     parser.add_argument("--no-output-metric-detach", dest="output_metric_detach", action="store_false",
                         help="Backpropagate through output-metric diagonals in output-metric-diag backward.")
+    parser.add_argument("--output-metric-bf16-projection", dest="output_metric_bf16_projection", action="store_true", default=None,
+                        help="Use bf16 arithmetic for detached output-metric-diag token projections.")
+    parser.add_argument("--no-output-metric-bf16-projection", dest="output_metric_bf16_projection", action="store_false",
+                        help="Use fp32 arithmetic for output-metric-diag token projections.")
     parser.add_argument("--xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
                         help="Run XSA geometry interpretation on validation batches, save metrics, plot, and exit.")
     parser.add_argument("--xsa-interp-tests", default=None,
@@ -2144,6 +2159,8 @@ def apply_cli_overrides(args: Hyperparameters):
         args.model_xsa_lambda = cli_args.model_xsa_lambda
     if cli_args.output_metric_detach is not None:
         args.output_metric_detach = cli_args.output_metric_detach
+    if cli_args.output_metric_bf16_projection is not None:
+        args.output_metric_bf16_projection = cli_args.output_metric_bf16_projection
     if cli_args.xsa_interp is not None:
         args.xsa_interp = cli_args.xsa_interp
     if cli_args.xsa_interp_tests is not None:
@@ -2505,6 +2522,7 @@ print0(f"Extra val steps: {args.extra_val_steps}")
 print0(f"XSA mode: {args.xsa_mode}")
 print0(f"Model XSA lambda: {args.model_xsa_lambda}")
 print0(f"Output metric detach: {args.output_metric_detach}")
+print0(f"Output metric bf16 projection: {args.output_metric_bf16_projection}")
 print0(f"XSA interp: {args.xsa_interp}")
 print0(f"XSA interp tests: {args.xsa_interp_tests}")
 print0(f"XSA interp modes: {args.xsa_interp_modes}")
