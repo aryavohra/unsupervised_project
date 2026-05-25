@@ -8,9 +8,11 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
 
+import argparse
 import copy
 import glob
 import math
+import string
 import threading
 import time
 import uuid
@@ -1049,6 +1051,7 @@ class Yarn(nn.Module):
 
 @dataclass(slots=True)
 class AttnArgs:
+    layer_idx: int
     sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
@@ -1060,6 +1063,351 @@ class AttnArgs:
     train_max_seq_len: torch.Tensor
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+
+
+class XSAInterpRecorder:
+    def __init__(self, num_layers: int, num_heads: int, head_dim: int):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.head_count = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.token_count = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.cos_y_v_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.removed_frac_value_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.cos_y_post_v_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.removed_frac_value_post_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.y_norm_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.y_post_head_xsa_norm_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.y_gated_norm_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.attn_gate_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.attn_gate_sq_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.cos_o_x_pre_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.resid_frac_pre_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.cos_o_x_post_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.resid_frac_post_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.o_pre_model_xsa_norm_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.o_post_xsa_norm_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.model_span_frac_pre_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.model_span_increment_pre_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.model_span_frac_post_sum = torch.zeros(num_layers, device=device, dtype=torch.float64)
+        self.model_span_increment_post_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+
+    @torch.no_grad()
+    def record(
+        self,
+        layer_idx: int,
+        x: Tensor,
+        y_raw: Tensor,
+        y_post_head_xsa: Tensor,
+        y_gated: Tensor,
+        attn_gate: Tensor,
+        v_heads: Tensor,
+        o_pre_model_xsa: Tensor,
+        o_post_xsa: Tensor,
+        wo_w: Tensor,
+    ):
+        def record_head_alignment(y_heads: Tensor, cos_sum: Tensor, frac_sum: Tensor):
+            y_f = y_heads.float()
+            v_f = v_heads.float()
+            dot_y_v = (y_f * v_f).sum(dim=-1)
+            y_norm_sq = y_f.square().sum(dim=-1).clamp_min(1e-12)
+            v_norm_sq = v_f.square().sum(dim=-1).clamp_min(1e-12)
+            cos_y_v = dot_y_v / (y_norm_sq.sqrt() * v_norm_sq.sqrt())
+            removed_frac_value = dot_y_v.square() / (y_norm_sq * v_norm_sq)
+            cos_sum[layer_idx].add_(cos_y_v.double().sum(dim=(0, 1)))
+            frac_sum[layer_idx].add_(removed_frac_value.double().sum(dim=(0, 1)))
+
+        self.head_count[layer_idx].add_(y_raw.size(0) * y_raw.size(1))
+        record_head_alignment(y_raw, self.cos_y_v_sum, self.removed_frac_value_sum)
+        record_head_alignment(y_post_head_xsa, self.cos_y_post_v_sum, self.removed_frac_value_post_sum)
+        self.y_norm_sum[layer_idx].add_(y_raw.float().norm(dim=-1).double().sum(dim=(0, 1)))
+        self.y_post_head_xsa_norm_sum[layer_idx].add_(y_post_head_xsa.float().norm(dim=-1).double().sum(dim=(0, 1)))
+        self.y_gated_norm_sum[layer_idx].add_(y_gated.float().norm(dim=-1).double().sum(dim=(0, 1)))
+        gate = attn_gate.float().squeeze(-1)
+        self.attn_gate_sum[layer_idx].add_(gate.double().sum(dim=(0, 1)))
+        self.attn_gate_sq_sum[layer_idx].add_(gate.square().double().sum(dim=(0, 1)))
+
+        def record_resid_alignment(o: Tensor, cos_sum: Tensor, frac_sum: Tensor):
+            o_f = o.float()
+            x_f = x.float()
+            dot_o_x = (o_f * x_f).sum(dim=-1)
+            o_norm_sq = o_f.square().sum(dim=-1).clamp_min(1e-12)
+            x_norm_sq = x_f.square().sum(dim=-1).clamp_min(1e-12)
+            cos_o_x = dot_o_x / (o_norm_sq.sqrt() * x_norm_sq.sqrt())
+            resid_frac = dot_o_x.square() / (o_norm_sq * x_norm_sq)
+            cos_sum[layer_idx].add_(cos_o_x.double().sum())
+            frac_sum[layer_idx].add_(resid_frac.double().sum())
+            return o_f, o_norm_sq
+
+        o_pre_f, o_pre_norm_sq = record_resid_alignment(o_pre_model_xsa, self.cos_o_x_pre_sum, self.resid_frac_pre_sum)
+        o_post_f, o_post_norm_sq = record_resid_alignment(o_post_xsa, self.cos_o_x_post_sum, self.resid_frac_post_sum)
+        self.o_pre_model_xsa_norm_sum[layer_idx].add_(o_pre_norm_sq.sqrt().double().sum())
+        self.o_post_xsa_norm_sum[layer_idx].add_(o_post_norm_sq.sqrt().double().sum())
+        self.token_count[layer_idx].add_(o_post_xsa.numel() // o_post_xsa.size(-1))
+
+        def record_model_span(o_f: Tensor, o_norm_sq: Tensor, frac_sum: Tensor, increment_sum: Tensor):
+            model_span_proj = torch.zeros_like(o_f)
+            increment_fracs = []
+            basis = []
+            o_norm_sq_keepdim = o_norm_sq.unsqueeze(-1)
+
+            for h in range(self.num_heads):
+                h0 = h * self.head_dim
+                h1 = (h + 1) * self.head_dim
+                u = F.linear(v_heads[:, :, h, :].float(), wo_w[:, h0:h1].float()).float()
+                for b in basis:
+                    b_norm_sq = b.square().sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                    u = u - ((u * b).sum(dim=-1, keepdim=True) / b_norm_sq) * b
+                u_norm_sq = u.square().sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                proj_h = ((o_f * u).sum(dim=-1, keepdim=True) / u_norm_sq) * u
+                model_span_proj = model_span_proj + proj_h
+                increment_fracs.append((proj_h.square().sum(dim=-1, keepdim=True) / o_norm_sq_keepdim).squeeze(-1))
+                basis.append(u)
+
+            model_span_frac = model_span_proj.square().sum(dim=-1) / o_norm_sq
+            model_span_increment = torch.stack(increment_fracs, dim=-1)
+            frac_sum[layer_idx].add_(model_span_frac.double().sum())
+            increment_sum[layer_idx].add_(model_span_increment.double().sum(dim=(0, 1)))
+
+        record_model_span(o_pre_f, o_pre_norm_sq, self.model_span_frac_pre_sum, self.model_span_increment_pre_sum)
+        record_model_span(o_post_f, o_post_norm_sq, self.model_span_frac_post_sum, self.model_span_increment_post_sum)
+
+    def sync_distributed(self):
+        if dist.is_initialized():
+            for tensor in (
+                self.head_count, self.token_count, self.cos_y_v_sum, self.removed_frac_value_sum,
+                self.cos_y_post_v_sum, self.removed_frac_value_post_sum, self.y_norm_sum,
+                self.y_post_head_xsa_norm_sum, self.y_gated_norm_sum, self.attn_gate_sum,
+                self.attn_gate_sq_sum, self.cos_o_x_pre_sum, self.resid_frac_pre_sum,
+                self.cos_o_x_post_sum, self.resid_frac_post_sum, self.o_pre_model_xsa_norm_sum,
+                self.o_post_xsa_norm_sum, self.model_span_frac_pre_sum, self.model_span_increment_pre_sum,
+                self.model_span_frac_post_sum, self.model_span_increment_post_sum,
+            ):
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    def as_numpy(self):
+        head_den = self.head_count.clamp_min(1).unsqueeze(-1)
+        token_den = self.token_count.clamp_min(1)
+        data = {
+            "head_count": self.head_count.detach().cpu().numpy(),
+            "token_count": self.token_count.detach().cpu().numpy(),
+            "cos_y_v": (self.cos_y_v_sum / head_den).detach().cpu().numpy(),
+            "removed_frac_value": (self.removed_frac_value_sum / head_den).detach().cpu().numpy(),
+            "cos_y_post_v": (self.cos_y_post_v_sum / head_den).detach().cpu().numpy(),
+            "removed_frac_value_post": (self.removed_frac_value_post_sum / head_den).detach().cpu().numpy(),
+            "y_norm": (self.y_norm_sum / head_den).detach().cpu().numpy(),
+            "y_post_head_xsa_norm": (self.y_post_head_xsa_norm_sum / head_den).detach().cpu().numpy(),
+            "y_gated_norm": (self.y_gated_norm_sum / head_den).detach().cpu().numpy(),
+            "attn_gate_mean": (self.attn_gate_sum / head_den).detach().cpu().numpy(),
+            "attn_gate_std": (
+                (self.attn_gate_sq_sum / head_den - (self.attn_gate_sum / head_den).square()).clamp_min(0.0).sqrt()
+            ).detach().cpu().numpy(),
+            "cos_o_x_pre": (self.cos_o_x_pre_sum / token_den).detach().cpu().numpy(),
+            "resid_frac_pre": (self.resid_frac_pre_sum / token_den).detach().cpu().numpy(),
+            "cos_o_x_post": (self.cos_o_x_post_sum / token_den).detach().cpu().numpy(),
+            "resid_frac_post": (self.resid_frac_post_sum / token_den).detach().cpu().numpy(),
+            "o_pre_model_xsa_norm": (self.o_pre_model_xsa_norm_sum / token_den).detach().cpu().numpy(),
+            "o_post_xsa_norm": (self.o_post_xsa_norm_sum / token_den).detach().cpu().numpy(),
+            "model_span_frac_pre": (self.model_span_frac_pre_sum / token_den).detach().cpu().numpy(),
+            "model_span_increment_pre": (self.model_span_increment_pre_sum / head_den).detach().cpu().numpy(),
+            "model_span_frac_post": (self.model_span_frac_post_sum / token_den).detach().cpu().numpy(),
+            "model_span_increment_post": (self.model_span_increment_post_sum / head_den).detach().cpu().numpy(),
+        }
+        data["resid_frac"] = data["resid_frac_post"]
+        data["model_span_frac"] = data["model_span_frac_post"]
+        data["model_span_increment"] = data["model_span_increment_post"]
+        attention_mask = data["head_count"] > 0
+        for name in ("cos_y_v", "removed_frac_value", "cos_y_post_v", "removed_frac_value_post",
+                     "y_norm", "y_post_head_xsa_norm", "y_gated_norm", "attn_gate_mean", "attn_gate_std",
+                     "model_span_increment_pre", "model_span_increment_post", "model_span_increment"):
+            data[name][~attention_mask] = np.nan
+        token_mask = data["token_count"] == 0
+        for name in ("cos_o_x_pre", "resid_frac_pre", "cos_o_x_post", "resid_frac_post",
+                     "o_pre_model_xsa_norm", "o_post_xsa_norm",
+                     "model_span_frac_pre", "model_span_frac_post", "resid_frac", "model_span_frac"):
+            data[name][token_mask] = np.nan
+        return data
+
+
+xsa_interp_recorder: XSAInterpRecorder | None = None
+
+
+LOSS_SLICE_DISTANCE_BINS = (
+    ("none", -1, -1),
+    ("1_16", 1, 16),
+    ("17_128", 17, 128),
+    ("129_512", 129, 512),
+    ("513_2048", 513, 2048),
+    ("gt_2048", 2049, None),
+)
+
+
+def _build_token_class_masks(vocab_size: int):
+    whitespace = np.zeros(vocab_size, dtype=bool)
+    punctuation = np.zeros(vocab_size, dtype=bool)
+    delimiter = np.zeros(vocab_size, dtype=bool)
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+    except Exception:
+        enc = None
+
+    delimiter_chars = set("\n\r\t{}[]()<>=:;,.|/\\-_`\"'")
+    punctuation_chars = set(string.punctuation)
+    for token_id in range(min(50257, vocab_size)):
+        if enc is None:
+            text = ""
+        else:
+            try:
+                text = enc.decode([token_id])
+            except Exception:
+                text = ""
+        stripped = text.strip()
+        whitespace[token_id] = bool(text) and text.isspace()
+        punctuation[token_id] = bool(stripped) and all(ch in punctuation_chars for ch in stripped)
+        delimiter[token_id] = any(ch in delimiter_chars for ch in text)
+    return whitespace, punctuation, delimiter
+
+
+def _distance_bucket_ids(distances: np.ndarray):
+    bucket_ids = np.zeros(distances.shape, dtype=np.int64)
+    for idx, (_, lo, hi) in enumerate(LOSS_SLICE_DISTANCE_BINS):
+        if lo == -1:
+            bucket_ids[distances < 0] = idx
+        elif hi is None:
+            bucket_ids[distances >= lo] = idx
+        else:
+            bucket_ids[(distances >= lo) & (distances <= hi)] = idx
+    return bucket_ids
+
+
+def _loss_slice_bucket_masks(inputs: np.ndarray, targets: np.ndarray, cum_seqlens: np.ndarray, vocab_size: int, token_class_masks):
+    n = int(targets.shape[0])
+    bucket_masks = [("all", np.ones(n, dtype=bool))]
+    whitespace, punctuation, delimiter = token_class_masks
+    valid_targets = (targets >= 0) & (targets < vocab_size)
+
+    target_counts = np.bincount(targets[valid_targets], minlength=vocab_size)
+    per_token_freq = np.zeros(n, dtype=np.int64)
+    per_token_freq[valid_targets] = target_counts[targets[valid_targets]]
+    bucket_masks.extend([
+        ("target_freq_1", per_token_freq == 1),
+        ("target_freq_2_4", (per_token_freq >= 2) & (per_token_freq <= 4)),
+        ("target_freq_5_16", (per_token_freq >= 5) & (per_token_freq <= 16)),
+        ("target_freq_gt_16", per_token_freq > 16),
+        ("target_whitespace", valid_targets & whitespace[targets.clip(0, vocab_size - 1)]),
+        ("target_punctuation", valid_targets & punctuation[targets.clip(0, vocab_size - 1)]),
+        ("target_delimiter", valid_targets & delimiter[targets.clip(0, vocab_size - 1)]),
+    ])
+
+    repeated_input = np.zeros(n, dtype=bool)
+    repeated_target = np.zeros(n, dtype=bool)
+    repeated_prev_bigram = np.zeros(n, dtype=bool)
+    repeated_prev_trigram = np.zeros(n, dtype=bool)
+    nearest_target_dist = np.full(n, -1, dtype=np.int64)
+    farthest_target_dist = np.full(n, -1, dtype=np.int64)
+
+    boundaries = [0]
+    for value in cum_seqlens:
+        value = int(value)
+        if 0 < value < n and value != boundaries[-1]:
+            boundaries.append(value)
+    if boundaries[-1] != n:
+        boundaries.append(n)
+
+    for start, end in pairwise(boundaries):
+        seen_tokens = set()
+        first_pos_by_token = {}
+        last_pos_by_token = {}
+        seen_bigrams = set()
+        seen_trigrams = set()
+        for pos in range(start, end):
+            inp = int(inputs[pos])
+            tgt = int(targets[pos])
+            repeated_input[pos] = inp in seen_tokens
+            repeated_target[pos] = tgt in seen_tokens
+            if tgt in last_pos_by_token:
+                nearest_target_dist[pos] = pos - last_pos_by_token[tgt]
+                farthest_target_dist[pos] = pos - first_pos_by_token[tgt]
+            if pos - 1 >= start:
+                prev_bigram = (int(inputs[pos - 1]), inp)
+                repeated_prev_bigram[pos] = prev_bigram in seen_bigrams
+                seen_bigrams.add(prev_bigram)
+            if pos - 2 >= start:
+                prev_trigram = (int(inputs[pos - 2]), int(inputs[pos - 1]), inp)
+                repeated_prev_trigram[pos] = prev_trigram in seen_trigrams
+                seen_trigrams.add(prev_trigram)
+            if inp not in first_pos_by_token:
+                first_pos_by_token[inp] = pos
+            last_pos_by_token[inp] = pos
+            seen_tokens.add(inp)
+
+    bucket_masks.extend([
+        ("input_repeated_in_context", repeated_input),
+        ("target_seen_in_context", repeated_target),
+        ("prev_bigram_repeated", repeated_prev_bigram),
+        ("prev_trigram_repeated", repeated_prev_trigram),
+    ])
+    nearest_bucket_ids = _distance_bucket_ids(nearest_target_dist)
+    farthest_bucket_ids = _distance_bucket_ids(farthest_target_dist)
+    for idx, (label, _, _) in enumerate(LOSS_SLICE_DISTANCE_BINS):
+        bucket_masks.append((f"target_nearest_distance_{label}", nearest_bucket_ids == idx))
+        bucket_masks.append((f"target_farthest_distance_{label}", farthest_bucket_ids == idx))
+    return bucket_masks
+
+
+class XSALossSliceRecorder:
+    def __init__(self, mode_names: tuple[str, ...], bucket_names: list[str]):
+        self.mode_names = tuple(mode_names)
+        self.bucket_names = tuple(bucket_names)
+        self.count = torch.zeros(len(bucket_names), device=device, dtype=torch.float64)
+        self.loss_sum = torch.zeros(len(mode_names), len(bucket_names), device=device, dtype=torch.float64)
+        self.delta_sum = torch.zeros(len(mode_names), len(bucket_names), device=device, dtype=torch.float64)
+        self.delta_sq_sum = torch.zeros(len(mode_names), len(bucket_names), device=device, dtype=torch.float64)
+        self.positive_delta_count = torch.zeros(len(mode_names), len(bucket_names), device=device, dtype=torch.float64)
+
+    @torch.no_grad()
+    def record(self, losses_by_mode: list[Tensor], bucket_masks: list[tuple[str, np.ndarray]]):
+        baseline = losses_by_mode[0].double()
+        for bucket_idx, (_, mask_np) in enumerate(bucket_masks):
+            if not mask_np.any():
+                continue
+            mask = torch.from_numpy(mask_np).to(device=device)
+            bucket_count = mask.sum().to(torch.float64)
+            self.count[bucket_idx].add_(bucket_count)
+            baseline_bucket = baseline[mask]
+            for mode_idx, loss in enumerate(losses_by_mode):
+                loss_bucket = loss.double()[mask]
+                delta = baseline_bucket - loss_bucket
+                self.loss_sum[mode_idx, bucket_idx].add_(loss_bucket.sum())
+                self.delta_sum[mode_idx, bucket_idx].add_(delta.sum())
+                self.delta_sq_sum[mode_idx, bucket_idx].add_(delta.square().sum())
+                self.positive_delta_count[mode_idx, bucket_idx].add_((delta > 0).sum().to(torch.float64))
+
+    def sync_distributed(self):
+        if dist.is_initialized():
+            for tensor in (self.count, self.loss_sum, self.delta_sum, self.delta_sq_sum, self.positive_delta_count):
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    def as_numpy(self):
+        den = self.count.clamp_min(1).unsqueeze(0)
+        delta_mean = self.delta_sum / den
+        delta_var = (self.delta_sq_sum / den - delta_mean.square()).clamp_min(0.0)
+        data = {
+            "mode_names": np.array(self.mode_names),
+            "bucket_names": np.array(self.bucket_names),
+            "bucket_count": self.count.detach().cpu().numpy(),
+            "loss_mean": (self.loss_sum / den).detach().cpu().numpy(),
+            "delta_loss_mean": delta_mean.detach().cpu().numpy(),
+            "delta_loss_std": delta_var.sqrt().detach().cpu().numpy(),
+            "delta_loss_sum": self.delta_sum.detach().cpu().numpy(),
+            "positive_delta_frac": (self.positive_delta_count / den).detach().cpu().numpy(),
+        }
+        empty = data["bucket_count"] == 0
+        for name in ("loss_mean", "delta_loss_mean", "delta_loss_std", "positive_delta_frac"):
+            data[name][:, empty] = np.nan
+        return data
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1122,16 +1470,51 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
+        y_raw = y
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
-        if attn_args.xsa_alpha is not None and not self.paired:
+        if args.xsa_mode == "record" and attn_args.xsa_alpha is not None and not self.paired:
             vn = F.normalize(v, dim=-1, eps=1e-4)
             proj = (y * vn).sum(-1, keepdim=True)
             alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
             y = y - alpha * proj * vn
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
+        elif args.xsa_mode == "value" and not self.paired:
+            y_f = y.float()
+            v_f = v.float()
+            numer = (y_f * v_f).sum(dim=-1, keepdim=True)
+            denom = v_f.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            y = (y_f - args.model_xsa_lambda * (numer / denom) * v_f).to(y.dtype)
+        elif args.xsa_mode == "output-metric-diag" and not self.paired:
+            y_f = y.float()
+            v_f = v.float()
+            wo_w = qkvo_w[self.dim * 3:].float()
+            metric_diag = wo_w.square().sum(dim=0).view(1, 1, self.num_heads, self.head_dim)
+            if args.output_metric_detach:
+                metric_diag = metric_diag.detach()
+            weighted_v = metric_diag * v_f
+            numer = (y_f * weighted_v).sum(dim=-1, keepdim=True)
+            denom = (v_f * weighted_v).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            y = (y_f - args.model_xsa_lambda * (numer / denom) * v_f).to(y.dtype)
+        y_post_head_xsa = y
+        attn_gate = torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        y_gated = y * attn_gate
+        y = y_gated.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        wo_w = qkvo_w[self.dim * 3:].type_as(y)
+        y = F.linear(y, sa_lambdas[1] * wo_w)  # sa_lambdas[1] pre-multiplied to O @shenberg
+        o_pre_model_xsa = y
+        if xsa_interp_recorder is not None and not self.paired:
+            xsa_interp_recorder.record(
+                attn_args.layer_idx,
+                x,
+                y_raw,
+                y_post_head_xsa,
+                y_gated,
+                attn_gate,
+                v,
+                o_pre_model_xsa,
+                y,
+                wo_w,
+            )
         return y
 
 
@@ -1352,9 +1735,13 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
-        # XSA on non-paired attn layers only; paired {0,2,5,9} and MLP-only layer 6 skipped
+        # Upstream learnable XSA on non-paired attn layers only; paired {0,2,5,9} and MLP-only layer 6 skipped.
+        # Alternative experimental XSA modes are selected inside attention and do not use learned alphas.
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
-        xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
+        if args.xsa_mode == "record":
+            xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
+        else:
+            xsa_alphas = [None] * self.num_layers
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
@@ -1427,6 +1814,7 @@ class GPT(nn.Module):
                     aux_v = None
 
                 attn_args = AttnArgs(
+                    layer_idx=i,
                     sa_lambdas=sa_lambdas[i],
                     seqlens=seqlens,
                     bm_size=bm_sizes[i],
@@ -1673,12 +2061,125 @@ class Hyperparameters:
     #   - (1 + m_r9) * x self-reference fuse on layer 9
     #   - backout_lambda fully removed (slot dropped from self.scalars; absorbed into MUDD bias init)
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    extra_val_steps: tuple[int, ...] = tuple(int(s) for s in os.environ.get("EXTRA_VAL_STEPS", "").replace(",", " ").split())
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
+    log_dir: str = os.environ.get("LOG_DIR", "logs")
+    checkpoint_dir: str = os.environ.get("CHECKPOINT_DIR", os.path.join(log_dir, "checkpoints"))
+    max_train_steps: int | None = int(os.environ["MAX_TRAIN_STEPS"]) if "MAX_TRAIN_STEPS" in os.environ else None
+    skip_warmup: bool = os.environ.get("SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
+    skip_validation: bool = os.environ.get("SKIP_VALIDATION", "0").lower() in ("1", "true", "yes")
+    xsa_mode: str = os.environ.get("XSA_MODE", "record").replace("_", "-")
+    model_xsa_lambda: float = float(os.environ.get("MODEL_XSA_LAMBDA", "1.0"))
+    output_metric_detach: bool = os.environ.get("OUTPUT_METRIC_DETACH", "0").lower() in ("1", "true", "yes")
+    xsa_interp: bool = os.environ.get("XSA_INTERP", "0").lower() in ("1", "true", "yes")
+    xsa_interp_tests: tuple[str, ...] = tuple(s for s in os.environ.get("XSA_INTERP_TESTS", "alignment").replace(",", " ").split())
+    xsa_interp_modes: tuple[str, ...] = tuple(s.replace("_", "-") for s in os.environ.get(
+        "XSA_INTERP_MODES",
+        "record none value output-metric-diag",
+    ).replace(",", " ").split())
+    xsa_interp_batches: int = int(os.environ.get("XSA_INTERP_BATCHES", "1"))
+    xsa_interp_batch_size: int = int(os.environ.get("XSA_INTERP_BATCH_SIZE", str(8 * 2048 * world_size * grad_accum_steps)))
+    xsa_interp_dir: str = os.environ.get("XSA_INTERP_DIR", "xsa_interp_logs")
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
 args = Hyperparameters()
+
+def apply_cli_overrides(args: Hyperparameters):
+    def bool_arg(value):
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() in ("", "1", "true", "yes")
+
+    parser = argparse.ArgumentParser(description="Train modded-nanogpt")
+    parser.add_argument("--max-train-steps", type=int, default=None, help="Cap optimizer steps; 1 runs one training step then exits.")
+    parser.add_argument("--skip-warmup", nargs="?", const=True, default=None, type=bool_arg, help="Skip the multi-shape compilation warmup.")
+    parser.add_argument("--skip-validation", nargs="?", const=True, default=None, type=bool_arg, help="Skip validation passes, including final validation.")
+    parser.add_argument("--val-loss-every", type=int, default=None, help="Override validation cadence; 0 disables periodic validation.")
+    parser.add_argument("--extra-val-steps", default=None, help="Comma- or space-separated extra validation steps.")
+    parser.add_argument("--run-id", default=None, help="Override the run id used for logs/checkpoints.")
+    parser.add_argument("--save-checkpoint", action="store_true", help="Save checkpoint at the final step.")
+    parser.add_argument("--run-evals", action="store_true", help="Run extra evals after training.")
+    parser.add_argument("--xsa-mode", choices=("record", "none", "value", "output-metric-diag"), default=None,
+                        help="Attention projection mode: upstream learnable XSA, no XSA, value-space XSA, or diagonal output-metric XSA.")
+    parser.add_argument("--model-xsa-lambda", type=float, default=None, help="Projection strength for value/output-metric-diag XSA modes.")
+    parser.add_argument("--output-metric-detach", dest="output_metric_detach", action="store_true", default=None,
+                        help="Treat output-metric diagonals as fixed in output-metric-diag backward.")
+    parser.add_argument("--no-output-metric-detach", dest="output_metric_detach", action="store_false",
+                        help="Backpropagate through output-metric diagonals in output-metric-diag backward.")
+    parser.add_argument("--xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
+                        help="Run XSA geometry interpretation on validation batches, save metrics, plot, and exit.")
+    parser.add_argument("--xsa-interp-tests", default=None,
+                        help="Comma- or space-separated interp tests to run. Supported: alignment, loss-slices.")
+    parser.add_argument("--xsa-interp-modes", default=None,
+                        help="Comma- or space-separated XSA modes to sweep. For loss-slices, the first mode is the baseline.")
+    parser.add_argument("--xsa-interp-batches", type=int, default=None,
+                        help="Number of validation batches to use for XSA geometry interpretation.")
+    parser.add_argument("--xsa-interp-batch-size", type=int, default=None,
+                        help="Total validation tokens per XSA interpretation batch across all ranks.")
+    parser.add_argument("--xsa-interp-dir", default=None,
+                        help="Directory for XSA geometry metric arrays and plots.")
+    cli_args, _ = parser.parse_known_args()
+
+    if cli_args.max_train_steps is not None:
+        args.max_train_steps = cli_args.max_train_steps
+    if cli_args.skip_warmup is not None:
+        args.skip_warmup = cli_args.skip_warmup
+    if cli_args.skip_validation is not None:
+        args.skip_validation = cli_args.skip_validation
+    if cli_args.val_loss_every is not None:
+        args.val_loss_every = cli_args.val_loss_every
+    if cli_args.extra_val_steps is not None:
+        args.extra_val_steps = tuple(int(s) for s in cli_args.extra_val_steps.replace(",", " ").split())
+    if cli_args.run_id is not None:
+        args.run_id = cli_args.run_id
+    if cli_args.save_checkpoint:
+        args.save_checkpoint = True
+    if cli_args.run_evals:
+        args.run_evals = True
+    if cli_args.xsa_mode is not None:
+        args.xsa_mode = cli_args.xsa_mode
+    if cli_args.model_xsa_lambda is not None:
+        args.model_xsa_lambda = cli_args.model_xsa_lambda
+    if cli_args.output_metric_detach is not None:
+        args.output_metric_detach = cli_args.output_metric_detach
+    if cli_args.xsa_interp is not None:
+        args.xsa_interp = cli_args.xsa_interp
+    if cli_args.xsa_interp_tests is not None:
+        args.xsa_interp_tests = tuple(s for s in cli_args.xsa_interp_tests.replace(",", " ").split())
+    if cli_args.xsa_interp_modes is not None:
+        args.xsa_interp_modes = tuple(s.replace("_", "-") for s in cli_args.xsa_interp_modes.replace(",", " ").split())
+    if cli_args.xsa_interp_batches is not None:
+        args.xsa_interp_batches = cli_args.xsa_interp_batches
+    if cli_args.xsa_interp_batch_size is not None:
+        args.xsa_interp_batch_size = cli_args.xsa_interp_batch_size
+    if cli_args.xsa_interp_dir is not None:
+        args.xsa_interp_dir = cli_args.xsa_interp_dir
+
+    supported_xsa_modes = ("record", "none", "value", "output-metric-diag")
+    if args.xsa_mode not in supported_xsa_modes:
+        raise ValueError(f"Unsupported XSA_MODE={args.xsa_mode!r}")
+    unsupported_interp_modes = tuple(mode for mode in args.xsa_interp_modes if mode not in supported_xsa_modes)
+    if unsupported_interp_modes:
+        raise ValueError(f"Unsupported XSA_INTERP_MODES entries: {unsupported_interp_modes}")
+    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices"))
+    if unsupported_interp_tests:
+        raise ValueError(f"Unsupported XSA_INTERP_TESTS entries: {unsupported_interp_tests}")
+    if args.xsa_interp and not args.xsa_interp_tests:
+        raise ValueError("XSA_INTERP_TESTS must include at least one test when XSA_INTERP is enabled")
+    if args.xsa_interp and any(test in args.xsa_interp_tests for test in ("alignment", "loss-slices")) and not args.xsa_interp_modes:
+        raise ValueError("XSA_INTERP_MODES must include at least one mode when alignment or loss-slices interp is enabled")
+    if not math.isfinite(args.model_xsa_lambda):
+        raise ValueError(f"MODEL_XSA_LAMBDA must be finite, got {args.model_xsa_lambda}")
+    if any(step < 0 for step in args.extra_val_steps):
+        raise ValueError(f"EXTRA_VAL_STEPS must be nonnegative, got {args.extra_val_steps}")
+    if args.xsa_interp_batches <= 0:
+        raise ValueError("XSA_INTERP_BATCHES must be positive")
+    if args.xsa_interp_batch_size <= 0 or args.xsa_interp_batch_size % (world_size * grad_accum_steps) != 0:
+        raise ValueError("XSA_INTERP_BATCH_SIZE must be positive and divisible by world_size * grad_accum_steps")
+
+apply_cli_overrides(args)
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -1976,8 +2477,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs(args.log_dir, exist_ok=True)
+    logfile = os.path.join(args.log_dir, f"{run_id}.txt")
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1993,6 +2494,23 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"Train files pattern: {args.train_files}")
+print0(f"Val files pattern: {args.val_files}")
+print0(f"Log dir: {args.log_dir}")
+print0(f"Checkpoint dir: {args.checkpoint_dir}")
+print0(f"Max train steps: {args.max_train_steps}")
+print0(f"Skip warmup: {args.skip_warmup}")
+print0(f"Skip validation: {args.skip_validation}")
+print0(f"Extra val steps: {args.extra_val_steps}")
+print0(f"XSA mode: {args.xsa_mode}")
+print0(f"Model XSA lambda: {args.model_xsa_lambda}")
+print0(f"Output metric detach: {args.output_metric_detach}")
+print0(f"XSA interp: {args.xsa_interp}")
+print0(f"XSA interp tests: {args.xsa_interp_tests}")
+print0(f"XSA interp modes: {args.xsa_interp_modes}")
+print0(f"XSA interp batches: {args.xsa_interp_batches}")
+print0(f"XSA interp batch size: {args.xsa_interp_batch_size}")
+print0(f"XSA interp dir: {args.xsa_interp_dir}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2022,45 +2540,169 @@ model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+if args.xsa_interp:
+    print0("Skipping torch.compile for XSA interpretation run", console=True)
+else:
+    model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
+
+
+def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn):
+    global xsa_interp_recorder
+    original_xsa_mode = args.xsa_mode
+    print_fn(
+        f"Running XSA interp tests {args.xsa_interp_tests} for {args.xsa_interp_batches} validation batch(es) "
+        f"of {args.xsa_interp_batch_size} total tokens",
+        console=True,
+    )
+    training_manager.advance_schedule(0)
+    model.eval()
+    alignment_results = []
+
+    try:
+        if "alignment" in args.xsa_interp_tests:
+            for mode in args.xsa_interp_modes:
+                args.xsa_mode = mode
+                print_fn(f"Running XSA alignment interp with xsa_mode={mode}", console=True)
+                xsa_interp_recorder = XSAInterpRecorder(num_layers=11, num_heads=6, head_dim=128)
+                val_loader = distributed_data_generator(
+                    args.val_files,
+                    args.xsa_interp_batch_size,
+                    -1,
+                    grad_accum_steps=grad_accum_steps,
+                    align_to_bos=False,
+                )
+                with torch.no_grad():
+                    for _ in range(args.xsa_interp_batches):
+                        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                del val_loader
+                xsa_interp_recorder.sync_distributed()
+                data = xsa_interp_recorder.as_numpy()
+                data["interp_test"] = np.array("alignment")
+                data["xsa_mode"] = np.array(mode)
+                data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
+                data["output_metric_detach"] = np.array(args.output_metric_detach)
+                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+                xsa_interp_recorder = None
+                alignment_results.append(data)
+                if master_process:
+                    from xsa_interp import save_xsa_interp_outputs
+
+                    mode_run_id = f"{args.run_id}_alignment_{mode.replace('-', '_')}"
+                    npz_path, svg_path = save_xsa_interp_outputs(data, args.xsa_interp_dir, mode_run_id)
+                    print_fn(f"Saved XSA alignment metrics for {mode}: {npz_path}", console=True)
+                    print_fn(f"Saved XSA alignment plot for {mode}: {svg_path}", console=True)
+
+            if master_process:
+                from xsa_interp import save_xsa_alignment_sweep_outputs
+
+                npz_path, svg_path = save_xsa_alignment_sweep_outputs(alignment_results, args.xsa_interp_dir, args.run_id)
+                print_fn(f"Saved XSA alignment sweep metrics: {npz_path}", console=True)
+                print_fn(f"Saved XSA alignment sweep plot: {svg_path}", console=True)
+
+        if "loss-slices" in args.xsa_interp_tests:
+            print_fn(
+                f"Running XSA loss-slice interp with baseline xsa_mode={args.xsa_interp_modes[0]}",
+                console=True,
+            )
+            token_class_masks = _build_token_class_masks(model.vocab_size)
+            loss_slice_recorder = None
+            val_loader = distributed_data_generator(
+                args.val_files,
+                args.xsa_interp_batch_size,
+                -1,
+                grad_accum_steps=grad_accum_steps,
+                align_to_bos=False,
+            )
+            with torch.no_grad():
+                for _ in range(args.xsa_interp_batches):
+                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                    bucket_masks = _loss_slice_bucket_masks(
+                        inputs.detach().cpu().numpy(),
+                        targets.detach().cpu().numpy(),
+                        cum_seqlens.detach().cpu().numpy(),
+                        model.vocab_size,
+                        token_class_masks,
+                    )
+                    if loss_slice_recorder is None:
+                        loss_slice_recorder = XSALossSliceRecorder(
+                            args.xsa_interp_modes,
+                            [name for name, _ in bucket_masks],
+                        )
+                    losses_by_mode = []
+                    for mode in args.xsa_interp_modes:
+                        args.xsa_mode = mode
+                        losses_by_mode.append(
+                            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).detach()
+                        )
+                    loss_slice_recorder.record(losses_by_mode, bucket_masks)
+            del val_loader
+            if loss_slice_recorder is not None:
+                loss_slice_recorder.sync_distributed()
+                data = loss_slice_recorder.as_numpy()
+                data["interp_test"] = np.array("loss-slices")
+                data["baseline_xsa_mode"] = np.array(args.xsa_interp_modes[0])
+                data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
+                data["output_metric_detach"] = np.array(args.output_metric_detach)
+                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+                if master_process:
+                    from xsa_interp import save_xsa_loss_slice_outputs
+
+                    npz_path, svg_path = save_xsa_loss_slice_outputs(data, args.xsa_interp_dir, args.run_id)
+                    print_fn(f"Saved XSA loss-slice metrics: {npz_path}", console=True)
+                    print_fn(f"Saved XSA loss-slice plot: {svg_path}", console=True)
+    finally:
+        args.xsa_mode = original_xsa_mode
+        xsa_interp_recorder = None
+
+
+if args.xsa_interp:
+    run_xsa_interp(model, training_manager, print0)
+    dist.destroy_process_group()
+    sys.exit(0)
 
 
 ########################################
 #            Warmup kernels            #
 ########################################
-print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+if args.skip_warmup:
+    print0("Skipping kernel warmup", console=True)
+else:
+    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
+    # Warmup the training kernels, then re-initialize the state so we aren't cheating
+    initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                         optimizer=training_manager.get_state()) # save the initial state
+    train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
-transition_steps = training_manager.get_transition_steps()
-# first and last pair of steps in each transition
-warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
-print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-    model.train()
-    for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
-        training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
-        training_manager.sparse_index_share(step)
-        loss.backward()
-        del loss
-    training_manager.step_optimizers(step)
-print0("Resetting Model", console=True)
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizer"])
-del val_loader, train_loader, initial_state
+    transition_steps = training_manager.get_transition_steps()
+    # first and last pair of steps in each transition
+    warmup_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2})
+    print0(f"Sampling steps {warmup_steps} for warmup", console=True)
+    for step in warmup_steps:
+        training_manager.advance_schedule(step)
+        model.eval()
+        with torch.no_grad():
+            inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+        model.train()
+        for idx in range(grad_accum_steps):
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+            training_manager.sparse_index_update(step, bigram_cpu)
+            loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+            training_manager.sparse_index_share(step)
+            loss.backward()
+            del loss
+        training_manager.step_optimizers(step)
+    print0("Resetting Model", console=True)
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    training_manager.reset(initial_state["optimizer"])
+    del val_loader, train_loader, initial_state
 model.train()
 
 ########################################
@@ -2076,11 +2718,14 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+if args.max_train_steps is not None:
+    train_steps = min(train_steps, args.max_train_steps)
+    print0(f"Capping training loop at {train_steps} optimizer steps", console=True)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if (not args.skip_validation) and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0) or step in args.extra_val_steps):
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
@@ -2107,8 +2752,9 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            checkpoint_dir = os.path.join(args.checkpoint_dir, run_id)
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            torch.save(log, os.path.join(checkpoint_dir, f"state_step{step:06d}.pt"))
         # the last step only has the validation loop, so break to avoid training
         break
 
