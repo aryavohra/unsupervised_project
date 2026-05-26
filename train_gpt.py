@@ -2274,6 +2274,17 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             num_tokens = new_num_tokens // new_grad_accum_steps
             max_seq_len = new_max_seq_len
 
+
+def next_data_batch(loader, send_args, started: bool):
+    if not started:
+        batch = next(loader)
+        started = True
+        if send_args is not None:
+            batch = loader.send(send_args)
+        return batch, started
+    return loader.send(send_args), started
+
+
 # -----------------------------------------------------------------------------
 # Training Management
 
@@ -3075,6 +3086,7 @@ else:
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
                          optimizer=training_manager.get_state()) # save the initial state
     train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+    train_loader_started = False
     val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
     transition_steps = training_manager.get_transition_steps()
@@ -3090,7 +3102,11 @@ else:
         model.train()
         for idx in range(grad_accum_steps):
             send_args = training_manager.train_loader_send_args
-            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
+            (inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu), train_loader_started = next_data_batch(
+                train_loader,
+                send_args,
+                train_loader_started,
+            )
             training_manager.sparse_index_update(step, bigram_cpu)
             loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
             training_manager.sparse_index_share(step)
@@ -3108,6 +3124,7 @@ model.train()
 #        Training and validation       #
 ########################################
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
+train_loader_started = False
 
 gc.collect()
 
@@ -3130,7 +3147,7 @@ if resume_step:
         training_manager.advance_schedule(skipped_step)
         for _ in range(grad_accum_steps):
             next_args = training_manager.train_loader_send_args
-            next(train_loader) if next_args is None else train_loader.send(next_args)
+            _, train_loader_started = next_data_batch(train_loader, next_args, train_loader_started)
     training_manager.advance_schedule(resume_step)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -3194,7 +3211,11 @@ for step in range(resume_step, train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
+        (inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu), train_loader_started = next_data_batch(
+            train_loader,
+            training_manager.train_loader_send_args,
+            train_loader_started,
+        )
         training_manager.sparse_index_update(step, bigram_cpu)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
         training_manager.sparse_index_share(step)
