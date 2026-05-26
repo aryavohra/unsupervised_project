@@ -297,3 +297,130 @@ def save_xsa_loss_slice_outputs(data: dict, save_dir: str, run_id: str):
         f.write("\n".join(parts))
 
     return npz_path, svg_path
+
+
+def save_xsa_attention_diag_outputs(data: dict, save_dir: str, run_id: str):
+    os.makedirs(save_dir, exist_ok=True)
+    npz_path = os.path.join(save_dir, f"{run_id}_attention_diagnostics.npz")
+    np.savez(npz_path, **data)
+
+    def finite_max(name: str, default: float = 1.0):
+        vals = data[name][np.isfinite(data[name])]
+        return float(vals.max(initial=default)) if vals.size else default
+
+    parts = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="1160" viewBox="0 0 1180 1160">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="32" y="38" font-size="22" font-weight="800">XSA Attention Diagnostics: {html.escape(str(data["xsa_mode"]))}</text>',
+    ]
+    _heatmap_svg(parts, data["self_mass"], 42, 92, "Self-attention mass aii",
+                 0.0, max(finite_max("self_mass"), 1e-9))
+    _heatmap_svg(parts, data["attention_entropy"], 360, 92, "Attention entropy H(a)",
+                 0.0, max(finite_max("attention_entropy"), 1e-9))
+    _heatmap_svg(parts, data["first_token_mass"], 680, 92, "First-token mass",
+                 0.0, max(finite_max("first_token_mass"), 1e-9))
+    _heatmap_svg(parts, data["diag_removed_frac"], 42, 430, "Diagonal removed fraction",
+                 0.0, max(finite_max("diag_removed_frac"), 1e-9))
+    _heatmap_svg(parts, data["context_parallel_removed_frac"], 360, 430, "Context-parallel removed fraction",
+                 0.0, max(finite_max("context_parallel_removed_frac"), 1e-9))
+    _heatmap_svg(parts, data["gate_mean"], 680, 430, "Gate mean",
+                 0.0, max(finite_max("gate_mean"), 1e-9))
+    _line_svg(
+        parts,
+        [
+            ("diag value norm", np.nanmean(data["diag_value_norm"], axis=1), "#ca0020"),
+            ("context value norm", np.nanmean(data["context_value_norm"], axis=1), "#0571b0"),
+            ("gated norm", np.nanmean(data["gated_norm"], axis=1), "#404040"),
+        ],
+        80,
+        760,
+        520,
+        150,
+        "Mean norms by layer",
+    )
+    corr = data["correlations"]
+    for idx, name in enumerate(data["corr_names"]):
+        values = corr[idx]
+        lim = float(max(abs(np.nanmin(values)), abs(np.nanmax(values)), 1e-9)) if np.isfinite(values).any() else 1.0
+        _heatmap_svg(parts, values, 680 if idx % 2 else 80, 760 + (idx // 2) * 100,
+                     f"corr: {html.escape(str(name))}", -lim, lim, diverging=True)
+    parts.append("</svg>")
+
+    svg_path = os.path.join(save_dir, f"{run_id}_attention_diagnostics.svg")
+    with open(svg_path, "w") as f:
+        f.write("\n".join(parts))
+    return npz_path, svg_path
+
+
+def save_xsa_attention_diag_sweep_outputs(results: list[dict], save_dir: str, run_id: str):
+    os.makedirs(save_dir, exist_ok=True)
+    modes = np.array([str(np.asarray(data["xsa_mode"]).item()) for data in results])
+    stack_keys = [
+        "count",
+        "self_mass",
+        "attention_entropy",
+        "first_token_mass",
+        "non_diag_mass",
+        "diag_value_norm",
+        "context_value_norm",
+        "removed_frac",
+        "diag_removed_frac",
+        "context_parallel_removed_frac",
+        "gate_mean",
+        "gated_norm",
+        "correlations",
+    ]
+    combined = {"xsa_modes": modes, "interp_test": np.array("attention-diagnostics")}
+    for key in stack_keys:
+        combined[key] = np.stack([data[key] for data in results], axis=0)
+    combined["corr_names"] = results[0]["corr_names"]
+    for key in ("model_xsa_lambda", "output_metric_detach", "xsa_interp_batches", "xsa_interp_batch_size"):
+        if key in results[0]:
+            combined[key] = np.asarray(results[0][key])
+
+    npz_path = os.path.join(save_dir, f"{run_id}_attention_diagnostics_sweep.npz")
+    np.savez(npz_path, **combined)
+
+    metrics = [
+        ("self mass", lambda d: np.nanmean(d["self_mass"])),
+        ("entropy", lambda d: np.nanmean(d["attention_entropy"])),
+        ("diag norm", lambda d: np.nanmean(d["diag_value_norm"])),
+        ("ctx norm", lambda d: np.nanmean(d["context_value_norm"])),
+        ("diag removed", lambda d: np.nanmean(d["diag_removed_frac"])),
+        ("ctx-parallel removed", lambda d: np.nanmean(d["context_parallel_removed_frac"])),
+        ("gate", lambda d: np.nanmean(d["gate_mean"])),
+        ("gated norm", lambda d: np.nanmean(d["gated_norm"])),
+    ]
+    values = np.array([[fn(data) for _, fn in metrics] for data in results], dtype=float)
+    finite = values[np.isfinite(values)]
+    vmax = float(finite.max(initial=1e-9)) if finite.size else 1.0
+    row_h = 28
+    col_w = 150
+    width = max(1180, 230 + col_w * len(metrics))
+    height = 170 + row_h * max(len(results), 1)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="32" y="38" font-size="22" font-weight="800">XSA Attention Diagnostics Sweep</text>',
+        '<text x="32" y="66" font-size="12" fill="#444">Rows are XSA modes; values are averages over non-paired layers/heads/tokens.</text>',
+    ]
+    x0 = 210
+    y0 = 116
+    parts.append(f'<text x="32" y="{y0 - 18}" font-size="13" font-weight="700">mode</text>')
+    for col, (label, _) in enumerate(metrics):
+        parts.append(f'<text x="{x0 + col * col_w}" y="{y0 - 18}" font-size="12" font-weight="700">{label}</text>')
+    for row, mode in enumerate(modes):
+        y = y0 + row * row_h
+        parts.append(f'<text x="32" y="{y + 18}" font-size="12">{html.escape(mode)}</text>')
+        for col in range(len(metrics)):
+            val = float(values[row, col])
+            color = _hex_color(val, 0.0, vmax)
+            x = x0 + col * col_w
+            parts.append(f'<rect x="{x}" y="{y}" width="136" height="22" fill="{color}" stroke="#ffffff"/>')
+            parts.append(f'<text x="{x + 8}" y="{y + 15}" font-size="11">{val:.5g}</text>')
+    parts.append("</svg>")
+
+    svg_path = os.path.join(save_dir, f"{run_id}_attention_diagnostics_sweep.svg")
+    with open(svg_path, "w") as f:
+        f.write("\n".join(parts))
+    return npz_path, svg_path

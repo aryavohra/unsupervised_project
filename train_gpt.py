@@ -1232,6 +1232,195 @@ class XSAInterpRecorder:
 xsa_interp_recorder: XSAInterpRecorder | None = None
 
 
+class XSAAttentionDiagRecorder:
+    corr_names = (
+        "self_mass_removed_frac",
+        "self_mass_gate",
+        "self_mass_gated_norm",
+        "removed_frac_gate",
+    )
+
+    def __init__(self, num_layers: int, num_heads: int):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.count = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.self_mass_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.entropy_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.first_token_mass_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.non_diag_mass_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.diag_value_norm_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.context_value_norm_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.removed_frac_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.diag_removed_frac_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.context_parallel_removed_frac_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.gate_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.gated_norm_sum = torch.zeros(num_layers, num_heads, device=device, dtype=torch.float64)
+        self.corr_count = torch.zeros(len(self.corr_names), num_layers, num_heads, device=device, dtype=torch.float64)
+        self.corr_x_sum = torch.zeros_like(self.corr_count)
+        self.corr_y_sum = torch.zeros_like(self.corr_count)
+        self.corr_x2_sum = torch.zeros_like(self.corr_count)
+        self.corr_y2_sum = torch.zeros_like(self.corr_count)
+        self.corr_xy_sum = torch.zeros_like(self.corr_count)
+
+    @torch.no_grad()
+    def record(
+        self,
+        layer_idx: int,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        y_raw: Tensor,
+        y_gated: Tensor,
+        attn_gate: Tensor,
+        seqlens: Tensor,
+        bm_size: int,
+        attn_scale: float,
+    ):
+        q = q[0].float()
+        k = k[0].float()
+        v = v[0].float()
+        y_raw = y_raw[0].float()
+        y_gated = y_gated[0].float()
+        gate = attn_gate[0].float().squeeze(-1)
+        boundaries = [int(x) for x in seqlens.detach().cpu().tolist()]
+        boundaries = [x for x in boundaries if 0 <= x <= q.size(0)]
+        if not boundaries or boundaries[0] != 0:
+            boundaries = [0, *boundaries]
+        if boundaries[-1] != q.size(0):
+            boundaries.append(q.size(0))
+
+        for start, end in pairwise(boundaries):
+            if end <= start:
+                continue
+            q_seg = q[start:end].transpose(0, 1)
+            k_seg = k[start:end].transpose(0, 1)
+            v_seg = v[start:end].transpose(0, 1)
+            y_seg = y_raw[start:end].transpose(0, 1)
+            y_gated_seg = y_gated[start:end].transpose(0, 1)
+            gate_seg = gate[start:end].transpose(0, 1)
+            length = end - start
+            scores = torch.matmul(q_seg, k_seg.transpose(-1, -2)) * attn_scale
+            row = torch.arange(length, device=device).view(length, 1)
+            col = torch.arange(length, device=device).view(1, length)
+            mask = col <= row
+            if bm_size is not None:
+                mask = mask & (col >= row - int(bm_size))
+            scores = scores.masked_fill(~mask.view(1, length, length), -torch.inf)
+            attn = torch.softmax(scores, dim=-1)
+            diag = attn.diagonal(dim1=-2, dim2=-1)
+            entropy = -(attn * attn.clamp_min(1e-30).log()).sum(dim=-1)
+            first_token_mass = attn[:, :, 0]
+            non_diag_mass = 1.0 - diag
+
+            attn_context = attn.clone()
+            diag_idx = torch.arange(length, device=device)
+            attn_context[:, diag_idx, diag_idx] = 0.0
+            context_value = torch.matmul(attn_context, v_seg)
+            diag_value = diag.unsqueeze(-1) * v_seg
+
+            y_norm_sq = y_seg.square().sum(dim=-1).clamp_min(1e-12)
+            v_norm_sq = v_seg.square().sum(dim=-1).clamp_min(1e-12)
+            dot_y_v = (y_seg * v_seg).sum(dim=-1)
+            dot_ctx_v = (context_value * v_seg).sum(dim=-1)
+            removed_frac = dot_y_v.square() / (y_norm_sq * v_norm_sq)
+            diag_removed_frac = diag.square() * v_norm_sq / y_norm_sq
+            context_parallel_removed_frac = dot_ctx_v.square() / (v_norm_sq * y_norm_sq)
+            diag_value_norm = diag_value.norm(dim=-1)
+            context_value_norm = context_value.norm(dim=-1)
+            gated_norm = y_gated_seg.norm(dim=-1)
+
+            self._add_metric_sums(
+                layer_idx,
+                count=length,
+                self_mass=diag,
+                entropy=entropy,
+                first_token_mass=first_token_mass,
+                non_diag_mass=non_diag_mass,
+                diag_value_norm=diag_value_norm,
+                context_value_norm=context_value_norm,
+                removed_frac=removed_frac,
+                diag_removed_frac=diag_removed_frac,
+                context_parallel_removed_frac=context_parallel_removed_frac,
+                gate=gate_seg,
+                gated_norm=gated_norm,
+            )
+            self._add_corr(layer_idx, 0, diag, removed_frac)
+            self._add_corr(layer_idx, 1, diag, gate_seg)
+            self._add_corr(layer_idx, 2, diag, gated_norm)
+            self._add_corr(layer_idx, 3, removed_frac, gate_seg)
+
+    def _add_metric_sums(self, layer_idx: int, count: int, **metrics):
+        self.count[layer_idx].add_(count)
+        self.self_mass_sum[layer_idx].add_(metrics["self_mass"].double().sum(dim=-1))
+        self.entropy_sum[layer_idx].add_(metrics["entropy"].double().sum(dim=-1))
+        self.first_token_mass_sum[layer_idx].add_(metrics["first_token_mass"].double().sum(dim=-1))
+        self.non_diag_mass_sum[layer_idx].add_(metrics["non_diag_mass"].double().sum(dim=-1))
+        self.diag_value_norm_sum[layer_idx].add_(metrics["diag_value_norm"].double().sum(dim=-1))
+        self.context_value_norm_sum[layer_idx].add_(metrics["context_value_norm"].double().sum(dim=-1))
+        self.removed_frac_sum[layer_idx].add_(metrics["removed_frac"].double().sum(dim=-1))
+        self.diag_removed_frac_sum[layer_idx].add_(metrics["diag_removed_frac"].double().sum(dim=-1))
+        self.context_parallel_removed_frac_sum[layer_idx].add_(metrics["context_parallel_removed_frac"].double().sum(dim=-1))
+        self.gate_sum[layer_idx].add_(metrics["gate"].double().sum(dim=-1))
+        self.gated_norm_sum[layer_idx].add_(metrics["gated_norm"].double().sum(dim=-1))
+
+    def _add_corr(self, layer_idx: int, corr_idx: int, x: Tensor, y: Tensor):
+        x = x.double()
+        y = y.double()
+        self.corr_count[corr_idx, layer_idx].add_(x.size(-1))
+        self.corr_x_sum[corr_idx, layer_idx].add_(x.sum(dim=-1))
+        self.corr_y_sum[corr_idx, layer_idx].add_(y.sum(dim=-1))
+        self.corr_x2_sum[corr_idx, layer_idx].add_(x.square().sum(dim=-1))
+        self.corr_y2_sum[corr_idx, layer_idx].add_(y.square().sum(dim=-1))
+        self.corr_xy_sum[corr_idx, layer_idx].add_((x * y).sum(dim=-1))
+
+    def sync_distributed(self):
+        if dist.is_initialized():
+            for tensor in (
+                self.count, self.self_mass_sum, self.entropy_sum, self.first_token_mass_sum,
+                self.non_diag_mass_sum, self.diag_value_norm_sum, self.context_value_norm_sum,
+                self.removed_frac_sum, self.diag_removed_frac_sum, self.context_parallel_removed_frac_sum,
+                self.gate_sum, self.gated_norm_sum, self.corr_count, self.corr_x_sum, self.corr_y_sum,
+                self.corr_x2_sum, self.corr_y2_sum, self.corr_xy_sum,
+            ):
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    def as_numpy(self):
+        den = self.count.clamp_min(1)
+        corr_den = self.corr_count.clamp_min(1)
+        cov = self.corr_xy_sum - self.corr_x_sum * self.corr_y_sum / corr_den
+        var_x = self.corr_x2_sum - self.corr_x_sum.square() / corr_den
+        var_y = self.corr_y2_sum - self.corr_y_sum.square() / corr_den
+        corr = cov / (var_x.clamp_min(1e-30).sqrt() * var_y.clamp_min(1e-30).sqrt())
+        data = {
+            "count": self.count.detach().cpu().numpy(),
+            "self_mass": (self.self_mass_sum / den).detach().cpu().numpy(),
+            "attention_entropy": (self.entropy_sum / den).detach().cpu().numpy(),
+            "first_token_mass": (self.first_token_mass_sum / den).detach().cpu().numpy(),
+            "non_diag_mass": (self.non_diag_mass_sum / den).detach().cpu().numpy(),
+            "diag_value_norm": (self.diag_value_norm_sum / den).detach().cpu().numpy(),
+            "context_value_norm": (self.context_value_norm_sum / den).detach().cpu().numpy(),
+            "removed_frac": (self.removed_frac_sum / den).detach().cpu().numpy(),
+            "diag_removed_frac": (self.diag_removed_frac_sum / den).detach().cpu().numpy(),
+            "context_parallel_removed_frac": (self.context_parallel_removed_frac_sum / den).detach().cpu().numpy(),
+            "gate_mean": (self.gate_sum / den).detach().cpu().numpy(),
+            "gated_norm": (self.gated_norm_sum / den).detach().cpu().numpy(),
+            "corr_names": np.array(self.corr_names),
+            "correlations": corr.detach().cpu().numpy(),
+        }
+        empty = data["count"] == 0
+        for name in (
+            "self_mass", "attention_entropy", "first_token_mass", "non_diag_mass",
+            "diag_value_norm", "context_value_norm", "removed_frac", "diag_removed_frac",
+            "context_parallel_removed_frac", "gate_mean", "gated_norm",
+        ):
+            data[name][empty] = np.nan
+        data["correlations"][:, empty] = np.nan
+        return data
+
+
+xsa_attention_diag_recorder: XSAAttentionDiagRecorder | None = None
+
+
 LOSS_SLICE_DISTANCE_BINS = (
     ("none", -1, -1),
     ("1_16", 1, 16),
@@ -1525,6 +1714,19 @@ class CausalSelfAttention(nn.Module):
                 o_pre_model_xsa,
                 y,
                 wo_w,
+            )
+        if xsa_attention_diag_recorder is not None and not self.paired:
+            xsa_attention_diag_recorder.record(
+                attn_args.layer_idx,
+                q,
+                k,
+                v,
+                y_raw,
+                y_gated,
+                attn_gate,
+                seqlens,
+                bm_size,
+                yarn.attn_scale,
             )
         return y
 
@@ -2076,6 +2278,8 @@ class Hyperparameters:
     run_evals: bool = False  # run additional evaluations after training is completed
     log_dir: str = os.environ.get("LOG_DIR", "logs")
     checkpoint_dir: str = os.environ.get("CHECKPOINT_DIR", os.path.join(log_dir, "checkpoints"))
+    load_checkpoint: str | None = os.environ.get("LOAD_CHECKPOINT")
+    load_optimizer: bool = os.environ.get("LOAD_OPTIMIZER", "0").lower() in ("1", "true", "yes")
     max_train_steps: int | None = int(os.environ["MAX_TRAIN_STEPS"]) if "MAX_TRAIN_STEPS" in os.environ else None
     skip_warmup: bool = os.environ.get("SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
     skip_validation: bool = os.environ.get("SKIP_VALIDATION", "0").lower() in ("1", "true", "yes")
@@ -2092,6 +2296,8 @@ class Hyperparameters:
     xsa_interp_batches: int = int(os.environ.get("XSA_INTERP_BATCHES", "1"))
     xsa_interp_batch_size: int = int(os.environ.get("XSA_INTERP_BATCH_SIZE", str(8 * 2048 * world_size * grad_accum_steps)))
     xsa_interp_dir: str = os.environ.get("XSA_INTERP_DIR", "xsa_interp_logs")
+    xsa_interp_step: int | None = int(os.environ["XSA_INTERP_STEP"]) if "XSA_INTERP_STEP" in os.environ else None
+    xsa_interp_final_ws: bool = os.environ.get("XSA_INTERP_FINAL_WS", "1").lower() in ("1", "true", "yes")
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -2111,6 +2317,10 @@ def apply_cli_overrides(args: Hyperparameters):
     parser.add_argument("--extra-val-steps", default=None, help="Comma- or space-separated extra validation steps.")
     parser.add_argument("--run-id", default=None, help="Override the run id used for logs/checkpoints.")
     parser.add_argument("--save-checkpoint", action="store_true", help="Save checkpoint at the final step.")
+    parser.add_argument("--load-checkpoint", default=None,
+                        help="Load model weights from a saved checkpoint before training or interp.")
+    parser.add_argument("--load-optimizer", action="store_true",
+                        help="Also load optimizer state from --load-checkpoint for training resumes.")
     parser.add_argument("--run-evals", action="store_true", help="Run extra evals after training.")
     parser.add_argument("--xsa-mode", choices=("record", "none", "value", "output-metric-diag"), default=None,
                         help="Attention projection mode: upstream learnable XSA, no XSA, value-space XSA, or diagonal output-metric XSA.")
@@ -2126,7 +2336,7 @@ def apply_cli_overrides(args: Hyperparameters):
     parser.add_argument("--xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
                         help="Run XSA geometry interpretation on validation batches, save metrics, plot, and exit.")
     parser.add_argument("--xsa-interp-tests", default=None,
-                        help="Comma- or space-separated interp tests to run. Supported: alignment, loss-slices.")
+                        help="Comma- or space-separated interp tests to run. Supported: alignment, loss-slices, attention-diagnostics.")
     parser.add_argument("--xsa-interp-modes", default=None,
                         help="Comma- or space-separated XSA modes to sweep. For loss-slices, the first mode is the baseline.")
     parser.add_argument("--xsa-interp-batches", type=int, default=None,
@@ -2135,6 +2345,10 @@ def apply_cli_overrides(args: Hyperparameters):
                         help="Total validation tokens per XSA interpretation batch across all ranks.")
     parser.add_argument("--xsa-interp-dir", default=None,
                         help="Directory for XSA geometry metric arrays and plots.")
+    parser.add_argument("--xsa-interp-step", type=int, default=None,
+                        help="Schedule step to use for XSA interp. Defaults to loaded checkpoint step when available, else 0.")
+    parser.add_argument("--xsa-interp-final-ws", nargs="?", const=True, default=None, type=bool_arg,
+                        help="Use final validation window extension during XSA interp.")
     cli_args, _ = parser.parse_known_args()
 
     if cli_args.max_train_steps is not None:
@@ -2151,6 +2365,10 @@ def apply_cli_overrides(args: Hyperparameters):
         args.run_id = cli_args.run_id
     if cli_args.save_checkpoint:
         args.save_checkpoint = True
+    if cli_args.load_checkpoint is not None:
+        args.load_checkpoint = cli_args.load_checkpoint
+    if cli_args.load_optimizer:
+        args.load_optimizer = True
     if cli_args.run_evals:
         args.run_evals = True
     if cli_args.xsa_mode is not None:
@@ -2173,6 +2391,10 @@ def apply_cli_overrides(args: Hyperparameters):
         args.xsa_interp_batch_size = cli_args.xsa_interp_batch_size
     if cli_args.xsa_interp_dir is not None:
         args.xsa_interp_dir = cli_args.xsa_interp_dir
+    if cli_args.xsa_interp_step is not None:
+        args.xsa_interp_step = cli_args.xsa_interp_step
+    if cli_args.xsa_interp_final_ws is not None:
+        args.xsa_interp_final_ws = cli_args.xsa_interp_final_ws
 
     supported_xsa_modes = ("record", "none", "value", "output-metric-diag")
     if args.xsa_mode not in supported_xsa_modes:
@@ -2180,17 +2402,21 @@ def apply_cli_overrides(args: Hyperparameters):
     unsupported_interp_modes = tuple(mode for mode in args.xsa_interp_modes if mode not in supported_xsa_modes)
     if unsupported_interp_modes:
         raise ValueError(f"Unsupported XSA_INTERP_MODES entries: {unsupported_interp_modes}")
-    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices"))
+    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices", "attention-diagnostics"))
     if unsupported_interp_tests:
         raise ValueError(f"Unsupported XSA_INTERP_TESTS entries: {unsupported_interp_tests}")
     if args.xsa_interp and not args.xsa_interp_tests:
         raise ValueError("XSA_INTERP_TESTS must include at least one test when XSA_INTERP is enabled")
-    if args.xsa_interp and any(test in args.xsa_interp_tests for test in ("alignment", "loss-slices")) and not args.xsa_interp_modes:
-        raise ValueError("XSA_INTERP_MODES must include at least one mode when alignment or loss-slices interp is enabled")
+    if args.xsa_interp and any(test in args.xsa_interp_tests for test in ("alignment", "loss-slices", "attention-diagnostics")) and not args.xsa_interp_modes:
+        raise ValueError("XSA_INTERP_MODES must include at least one mode when alignment, loss-slices, or attention-diagnostics interp is enabled")
     if not math.isfinite(args.model_xsa_lambda):
         raise ValueError(f"MODEL_XSA_LAMBDA must be finite, got {args.model_xsa_lambda}")
     if any(step < 0 for step in args.extra_val_steps):
         raise ValueError(f"EXTRA_VAL_STEPS must be nonnegative, got {args.extra_val_steps}")
+    if args.xsa_interp_step is not None and args.xsa_interp_step < 0:
+        raise ValueError(f"XSA_INTERP_STEP must be nonnegative, got {args.xsa_interp_step}")
+    if args.load_optimizer and args.load_checkpoint is None:
+        raise ValueError("--load-optimizer requires --load-checkpoint")
     if args.xsa_interp_batches <= 0:
         raise ValueError("XSA_INTERP_BATCHES must be positive")
     if args.xsa_interp_batch_size <= 0 or args.xsa_interp_batch_size % (world_size * grad_accum_steps) != 0:
@@ -2515,6 +2741,8 @@ print0(f"Train files pattern: {args.train_files}")
 print0(f"Val files pattern: {args.val_files}")
 print0(f"Log dir: {args.log_dir}")
 print0(f"Checkpoint dir: {args.checkpoint_dir}")
+print0(f"Load checkpoint: {args.load_checkpoint}")
+print0(f"Load optimizer: {args.load_optimizer}")
 print0(f"Max train steps: {args.max_train_steps}")
 print0(f"Skip warmup: {args.skip_warmup}")
 print0(f"Skip validation: {args.skip_validation}")
@@ -2529,6 +2757,8 @@ print0(f"XSA interp modes: {args.xsa_interp_modes}")
 print0(f"XSA interp batches: {args.xsa_interp_batches}")
 print0(f"XSA interp batch size: {args.xsa_interp_batch_size}")
 print0(f"XSA interp dir: {args.xsa_interp_dir}")
+print0(f"XSA interp step: {args.xsa_interp_step}")
+print0(f"XSA interp final ws: {args.xsa_interp_final_ws}")
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2555,6 +2785,21 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 model.mudd_w1.data = model.mudd_w1.data.bfloat16()
 model.mudd_w2.data = model.mudd_w2.data.bfloat16()
 model.mudd_b2.data = model.mudd_b2.data.bfloat16()
+loaded_checkpoint = None
+loaded_checkpoint_step = None
+if args.load_checkpoint is not None:
+    print0(f"Loading checkpoint from {args.load_checkpoint}", console=True)
+    loaded_checkpoint = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
+    state_dict = loaded_checkpoint["model"] if isinstance(loaded_checkpoint, dict) and "model" in loaded_checkpoint else loaded_checkpoint
+    if any(key.startswith("_orig_mod.") for key in state_dict):
+        state_dict = {
+            key.removeprefix("_orig_mod."): value
+            for key, value in state_dict.items()
+        }
+    model.load_state_dict(state_dict)
+    if isinstance(loaded_checkpoint, dict) and "step" in loaded_checkpoint:
+        loaded_checkpoint_step = int(loaded_checkpoint["step"])
+    print0(f"Loaded checkpoint step: {loaded_checkpoint_step}", console=True)
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -2563,17 +2808,37 @@ if args.xsa_interp:
 else:
     model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
+if args.load_optimizer and loaded_checkpoint is not None and isinstance(loaded_checkpoint, dict) and "optimizer" in loaded_checkpoint:
+    print0("Loading optimizer state from checkpoint", console=True)
+    training_manager.reset(loaded_checkpoint["optimizer"])
+if loaded_checkpoint is not None:
+    del loaded_checkpoint
+    gc.collect()
 
 
 def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn):
-    global xsa_interp_recorder
+    global xsa_interp_recorder, xsa_attention_diag_recorder
     original_xsa_mode = args.xsa_mode
     print_fn(
         f"Running XSA interp tests {args.xsa_interp_tests} for {args.xsa_interp_batches} validation batch(es) "
         f"of {args.xsa_interp_batch_size} total tokens",
         console=True,
     )
-    training_manager.advance_schedule(0)
+    interp_step = args.xsa_interp_step
+    if interp_step is None:
+        interp_step = loaded_checkpoint_step if loaded_checkpoint_step is not None else 0
+    schedule_step = min(interp_step, len(training_schedule.mtp_weights) - 1)
+    if schedule_step != interp_step:
+        print_fn(
+            f"Clamping XSA interp schedule step from checkpoint step {interp_step} to available schedule step {schedule_step}",
+            console=True,
+        )
+    else:
+        print_fn(f"Using XSA interp schedule step {schedule_step}", console=True)
+    training_manager.advance_schedule(schedule_step)
+    if args.xsa_interp_final_ws:
+        print_fn("Applying final validation window extension for XSA interp", console=True)
+        training_manager.apply_final_ws_ext()
     model.eval()
     alignment_results = []
 
@@ -2601,6 +2866,8 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["xsa_mode"] = np.array(mode)
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
+                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
                 xsa_interp_recorder = None
@@ -2664,6 +2931,8 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["baseline_xsa_mode"] = np.array(args.xsa_interp_modes[0])
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
+                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
                 if master_process:
@@ -2672,9 +2941,55 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                     npz_path, svg_path = save_xsa_loss_slice_outputs(data, args.xsa_interp_dir, args.run_id)
                     print_fn(f"Saved XSA loss-slice metrics: {npz_path}", console=True)
                     print_fn(f"Saved XSA loss-slice plot: {svg_path}", console=True)
+
+        if "attention-diagnostics" in args.xsa_interp_tests:
+            attention_results = []
+            for mode in args.xsa_interp_modes:
+                args.xsa_mode = mode
+                print_fn(f"Running XSA attention diagnostics with xsa_mode={mode}", console=True)
+                xsa_attention_diag_recorder = XSAAttentionDiagRecorder(num_layers=11, num_heads=6)
+                val_loader = distributed_data_generator(
+                    args.val_files,
+                    args.xsa_interp_batch_size,
+                    -1,
+                    grad_accum_steps=grad_accum_steps,
+                    align_to_bos=False,
+                )
+                with torch.no_grad():
+                    for _ in range(args.xsa_interp_batches):
+                        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+                del val_loader
+                xsa_attention_diag_recorder.sync_distributed()
+                data = xsa_attention_diag_recorder.as_numpy()
+                data["interp_test"] = np.array("attention-diagnostics")
+                data["xsa_mode"] = np.array(mode)
+                data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
+                data["output_metric_detach"] = np.array(args.output_metric_detach)
+                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["xsa_interp_schedule_step"] = np.array(schedule_step)
+                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+                xsa_attention_diag_recorder = None
+                attention_results.append(data)
+                if master_process:
+                    from xsa_interp import save_xsa_attention_diag_outputs
+
+                    mode_run_id = f"{args.run_id}_attention_{mode.replace('-', '_')}"
+                    npz_path, svg_path = save_xsa_attention_diag_outputs(data, args.xsa_interp_dir, mode_run_id)
+                    print_fn(f"Saved XSA attention diagnostics for {mode}: {npz_path}", console=True)
+                    print_fn(f"Saved XSA attention diagnostics plot for {mode}: {svg_path}", console=True)
+
+            if master_process:
+                from xsa_interp import save_xsa_attention_diag_sweep_outputs
+
+                npz_path, svg_path = save_xsa_attention_diag_sweep_outputs(attention_results, args.xsa_interp_dir, args.run_id)
+                print_fn(f"Saved XSA attention diagnostics sweep metrics: {npz_path}", console=True)
+                print_fn(f"Saved XSA attention diagnostics sweep plot: {svg_path}", console=True)
     finally:
         args.xsa_mode = original_xsa_mode
         xsa_interp_recorder = None
+        xsa_attention_diag_recorder = None
 
 
 if args.xsa_interp:
