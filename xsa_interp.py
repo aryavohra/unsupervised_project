@@ -424,3 +424,181 @@ def save_xsa_attention_diag_sweep_outputs(results: list[dict], save_dir: str, ru
     with open(svg_path, "w") as f:
         f.write("\n".join(parts))
     return npz_path, svg_path
+
+
+def save_xsa_beta_diag_outputs(data: dict, save_dir: str, run_id: str):
+    os.makedirs(save_dir, exist_ok=True)
+    npz_path = os.path.join(save_dir, f"{run_id}_beta_diagnostics.npz")
+    np.savez(npz_path, **data)
+
+    buckets = [str(x) for x in data["bucket_names"]]
+    important_buckets = [
+        "all",
+        "input_repeated_in_context",
+        "target_seen_in_context",
+        "prev_bigram_repeated",
+        "prev_trigram_repeated",
+        "target_nearest_distance_1_16",
+        "target_nearest_distance_17_128",
+        "target_nearest_distance_129_512",
+        "target_freq_gt_16",
+        "target_punctuation",
+    ]
+    bucket_idxs = [buckets.index(name) for name in important_buckets if name in buckets]
+    if not bucket_idxs:
+        bucket_idxs = list(range(min(len(buckets), 10)))
+
+    xsa_layers = [1, 3, 4, 7, 8, 10]
+    intervened_layers = [3, 4, 7, 8]
+    layer_groups = [
+        ("xsa layers", xsa_layers),
+        ("intervened", intervened_layers),
+        ("layer 8", [8]),
+    ]
+    metrics = [
+        ("aii", "self_mass"),
+        ("beta", "beta_mean"),
+        ("abs beta", "beta_abs_mean"),
+        ("rms beta", "beta_rms"),
+        ("P(beta>0)", "beta_positive_frac"),
+        ("P(|beta|>aii)", "beta_abs_gt_self_mass_frac"),
+        ("|beta|/aii", "beta_abs_over_self_mass"),
+    ]
+
+    rows = []
+    for group_name, layers in layer_groups:
+        layer_idx = [layer for layer in layers if layer < data["count"].shape[0]]
+        if not layer_idx:
+            continue
+        count = data["count"][np.ix_(layer_idx, range(data["count"].shape[1]), bucket_idxs)]
+        weights = np.where(np.isfinite(count), count, 0.0)
+        for metric_label, key in metrics:
+            values = data[key][np.ix_(layer_idx, range(data[key].shape[1]), bucket_idxs)]
+            weighted = np.nansum(values * weights, axis=(0, 1)) / np.maximum(np.nansum(weights, axis=(0, 1)), 1.0)
+            rows.append((group_name, metric_label, weighted))
+
+    finite_vals = np.concatenate([row[2][np.isfinite(row[2])] for row in rows if np.isfinite(row[2]).any()])
+    vmax = float(finite_vals.max(initial=1e-9)) if finite_vals.size else 1.0
+    row_h = 24
+    col_w = 122
+    left_w = 220
+    top_h = 132
+    width = max(1180, left_w + col_w * len(bucket_idxs) + 70)
+    height = top_h + row_h * len(rows) + 80
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="32" y="38" font-size="22" font-weight="800">XSA Beta Diagnostics</text>',
+        '<text x="32" y="64" font-size="12" fill="#444">beta = &lt;y_context, v_i&gt; / ||v_i||^2. Values are count-weighted over heads and selected layers.</text>',
+    ]
+    for col, bucket_idx in enumerate(bucket_idxs):
+        label = html.escape(buckets[bucket_idx].replace("target_", "t_").replace("_distance_", "_dist_"))
+        x = left_w + col * col_w
+        parts.append(f'<text x="{x}" y="{top_h - 18}" font-size="10" transform="rotate(-28 {x},{top_h - 18})">{label}</text>')
+    parts.append(f'<text x="32" y="{top_h - 18}" font-size="12" font-weight="700">group / metric</text>')
+
+    for row, (group_name, metric_label, values) in enumerate(rows):
+        y = top_h + row * row_h
+        fill = "#fbfbfb" if row % 2 == 0 else "#ffffff"
+        parts.append(f'<rect x="24" y="{y - 4}" width="{width - 48}" height="{row_h}" fill="{fill}"/>')
+        parts.append(f'<text x="32" y="{y + 12}" font-size="10">{html.escape(group_name)} / {html.escape(metric_label)}</text>')
+        for col, val in enumerate(values):
+            x = left_w + col * col_w
+            if np.isfinite(val):
+                color = _hex_color(float(val), 0.0, vmax)
+                label = f"{float(val):.3g}"
+            else:
+                color = "#f2f2f2"
+                label = "nan"
+            parts.append(f'<rect x="{x}" y="{y - 3}" width="{col_w - 8}" height="18" fill="{color}" stroke="#ffffff"/>')
+            parts.append(f'<text x="{x + 5}" y="{y + 11}" font-size="9">{label}</text>')
+    parts.append("</svg>")
+
+    svg_path = os.path.join(save_dir, f"{run_id}_beta_diagnostics.svg")
+    with open(svg_path, "w") as f:
+        f.write("\n".join(parts))
+    return npz_path, svg_path
+
+
+def save_xsa_causal_intervention_outputs(data: dict, save_dir: str, run_id: str):
+    os.makedirs(save_dir, exist_ok=True)
+    npz_path = os.path.join(save_dir, f"{run_id}_causal_interventions.npz")
+    np.savez(npz_path, **data)
+
+    conditions = [str(x) for x in data["mode_names"]]
+    buckets = [str(x) for x in data["bucket_names"]]
+    delta_mean = data["delta_loss_mean"]
+    positive_frac = data["positive_delta_frac"]
+    counts = data["bucket_count"]
+    important_buckets = [
+        "all",
+        "target_seen_in_context",
+        "input_repeated_in_context",
+        "prev_bigram_repeated",
+        "prev_trigram_repeated",
+        "target_nearest_distance_1_16",
+        "target_nearest_distance_17_128",
+        "target_nearest_distance_129_512",
+        "target_nearest_distance_513_2048",
+        "target_freq_gt_16",
+    ]
+    bucket_idxs = [buckets.index(name) for name in important_buckets if name in buckets]
+    if not bucket_idxs:
+        bucket_idxs = list(range(min(len(buckets), 12)))
+
+    compare_idxs = list(range(1, len(conditions))) or [0]
+    all_idx = buckets.index("all") if "all" in buckets else 0
+    order = sorted(compare_idxs, key=lambda idx: float(delta_mean[idx, all_idx]))
+    max_rows = min(len(order), 48)
+    condition_idxs = order[:max_rows]
+
+    mat = delta_mean[np.ix_(condition_idxs, bucket_idxs)]
+    finite = mat[np.isfinite(mat)]
+    lim = float(max(abs(finite.min(initial=0.0)), abs(finite.max(initial=0.0)), 1e-9)) if finite.size else 1.0
+    row_h = 24
+    col_w = 126
+    left_w = 330
+    top_h = 128
+    width = max(1180, left_w + col_w * len(bucket_idxs) + 80)
+    height = top_h + row_h * max_rows + 80
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="32" y="38" font-size="22" font-weight="800">XSA Causal Interventions</text>',
+        '<text x="32" y="64" font-size="12" fill="#444">Delta loss is baseline_record - intervention; negative means the intervention is worse than the learned record baseline.</text>',
+    ]
+    for col, bucket_idx in enumerate(bucket_idxs):
+        label = html.escape(buckets[bucket_idx].replace("target_", "t_").replace("_distance_", "_dist_"))
+        x = left_w + col * col_w
+        parts.append(f'<text x="{x}" y="{top_h - 18}" font-size="10" transform="rotate(-28 {x},{top_h - 18})">{label}</text>')
+    parts.append(f'<text x="32" y="{top_h - 18}" font-size="12" font-weight="700">condition</text>')
+    parts.append(f'<text x="{left_w - 58}" y="{top_h - 18}" font-size="12" font-weight="700">all win%</text>')
+
+    for row, condition_idx in enumerate(condition_idxs):
+        y = top_h + row * row_h
+        fill = "#fbfbfb" if row % 2 == 0 else "#ffffff"
+        parts.append(f'<rect x="24" y="{y - 4}" width="{width - 48}" height="{row_h}" fill="{fill}"/>')
+        label = html.escape(conditions[condition_idx])
+        if len(label) > 44:
+            label = label[:41] + "..."
+        parts.append(f'<text x="32" y="{y + 12}" font-size="10">{label}</text>')
+        parts.append(f'<text x="{left_w - 52}" y="{y + 12}" font-size="10">{100 * float(positive_frac[condition_idx, all_idx]):.1f}</text>')
+        for col, bucket_idx in enumerate(bucket_idxs):
+            val = float(delta_mean[condition_idx, bucket_idx])
+            color = _hex_color(val, -lim, lim, diverging=True)
+            x = left_w + col * col_w
+            parts.append(f'<rect x="{x}" y="{y - 3}" width="{col_w - 8}" height="18" fill="{color}" stroke="#ffffff"/>')
+            parts.append(f'<text x="{x + 5}" y="{y + 11}" font-size="9">{val:+.3g}</text>')
+
+    legend_y = height - 42
+    parts.append(f'<text x="32" y="{legend_y}" font-size="11" fill="#444">Bucket counts: ')
+    parts.append(" ".join(
+        f'{html.escape(buckets[idx])}={int(counts[idx])}' for idx in bucket_idxs[:6]
+    ))
+    parts.append('</text>')
+    parts.append("</svg>")
+
+    svg_path = os.path.join(save_dir, f"{run_id}_causal_interventions.svg")
+    with open(svg_path, "w") as f:
+        f.write("\n".join(parts))
+    return npz_path, svg_path

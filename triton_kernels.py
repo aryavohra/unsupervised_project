@@ -901,7 +901,8 @@ ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
-ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+if hasattr(ce_fwd_bwd_kernel, "set_shared_memory_config"):
+    ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(

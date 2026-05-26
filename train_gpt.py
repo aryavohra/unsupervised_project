@@ -41,6 +41,14 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+xsa_interp_active = False
+
+
+def relu_squared_mlp(x: Tensor, w1: Tensor, w2: Tensor):
+    if xsa_interp_active:
+        post = F.relu(F.linear(x.to(w1.dtype), w1)).square()
+        return post @ w2
+    return ReLUSqrdMLP(x, w1, w2)
 
 dynamo.config.recompile_limit = 64
 
@@ -1444,6 +1452,151 @@ class XSAAttentionDiagRecorder:
 xsa_attention_diag_recorder: XSAAttentionDiagRecorder | None = None
 
 
+class XSABetaDiagRecorder:
+    def __init__(self, num_layers: int, num_heads: int, bucket_names: list[str]):
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.bucket_names = tuple(bucket_names)
+        shape = (num_layers, num_heads, len(bucket_names))
+        self.count = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_abs_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_sq_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_positive_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_abs_gt_self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_abs_over_self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.beta_minus_self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.diag_removed_frac_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.context_parallel_removed_frac_sum = torch.zeros(shape, device=device, dtype=torch.float64)
+        self.bucket_masks: list[Tensor] | None = None
+
+    def set_bucket_masks(self, bucket_masks: list[tuple[str, np.ndarray]]):
+        names = tuple(name for name, _ in bucket_masks)
+        if names != self.bucket_names:
+            raise ValueError(f"Beta bucket names changed from {self.bucket_names} to {names}")
+        self.bucket_masks = [
+            torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
+            for _, mask_np in bucket_masks
+        ]
+
+    @torch.no_grad()
+    def record(self, layer_idx: int, q: Tensor, k: Tensor, v: Tensor, y_raw: Tensor,
+               seqlens: Tensor, bm_size: int, attn_scale: float):
+        if self.bucket_masks is None:
+            raise RuntimeError("XSABetaDiagRecorder bucket masks must be set before recording")
+        q = q[0].float()
+        k = k[0].float()
+        v = v[0].float()
+        y_raw = y_raw[0].float()
+        boundaries = [int(x) for x in seqlens.detach().cpu().tolist()]
+        boundaries = [x for x in boundaries if 0 <= x <= q.size(0)]
+        if not boundaries or boundaries[0] != 0:
+            boundaries = [0, *boundaries]
+        if boundaries[-1] != q.size(0):
+            boundaries.append(q.size(0))
+
+        for start, end in pairwise(boundaries):
+            if end <= start:
+                continue
+            q_seg = q[start:end].transpose(0, 1)
+            k_seg = k[start:end].transpose(0, 1)
+            v_seg = v[start:end].transpose(0, 1)
+            y_seg = y_raw[start:end].transpose(0, 1)
+            length = end - start
+            scores = torch.matmul(q_seg, k_seg.transpose(-1, -2)) * attn_scale
+            row = torch.arange(length, device=device).view(length, 1)
+            col = torch.arange(length, device=device).view(1, length)
+            mask = col <= row
+            if bm_size is not None:
+                mask = mask & (col >= row - int(bm_size))
+            scores = scores.masked_fill(~mask.view(1, length, length), -torch.inf)
+            attn = torch.softmax(scores, dim=-1)
+            diag = attn.diagonal(dim1=-2, dim2=-1)
+            diag_idx = torch.arange(length, device=device)
+            attn_context = attn.clone()
+            attn_context[:, diag_idx, diag_idx] = 0.0
+            context_value = torch.matmul(attn_context, v_seg)
+
+            v_norm_sq = v_seg.square().sum(dim=-1).clamp_min(1e-12)
+            y_norm_sq = y_seg.square().sum(dim=-1).clamp_min(1e-12)
+            dot_ctx_v = (context_value * v_seg).sum(dim=-1)
+            beta = dot_ctx_v / v_norm_sq
+            beta_abs = beta.abs()
+            beta_sq = beta.square()
+            beta_positive = beta > 0
+            beta_abs_gt_self_mass = beta_abs > diag
+            beta_abs_over_self_mass = beta_abs / diag.clamp_min(1e-6)
+            beta_minus_self_mass = beta - diag
+            diag_removed_frac = diag.square() * v_norm_sq / y_norm_sq
+            context_parallel_removed_frac = dot_ctx_v.square() / (v_norm_sq * y_norm_sq)
+
+            for bucket_idx, bucket_mask in enumerate(self.bucket_masks):
+                token_mask = bucket_mask[start:end]
+                if not token_mask.any():
+                    continue
+                bucket_count = token_mask.sum().to(torch.float64)
+                self.count[layer_idx, :, bucket_idx].add_(bucket_count)
+                self.self_mass_sum[layer_idx, :, bucket_idx].add_(diag[:, token_mask].double().sum(dim=-1))
+                self.beta_sum[layer_idx, :, bucket_idx].add_(beta[:, token_mask].double().sum(dim=-1))
+                self.beta_abs_sum[layer_idx, :, bucket_idx].add_(beta_abs[:, token_mask].double().sum(dim=-1))
+                self.beta_sq_sum[layer_idx, :, bucket_idx].add_(beta_sq[:, token_mask].double().sum(dim=-1))
+                self.beta_positive_sum[layer_idx, :, bucket_idx].add_(beta_positive[:, token_mask].double().sum(dim=-1))
+                self.beta_abs_gt_self_mass_sum[layer_idx, :, bucket_idx].add_(
+                    beta_abs_gt_self_mass[:, token_mask].double().sum(dim=-1)
+                )
+                self.beta_abs_over_self_mass_sum[layer_idx, :, bucket_idx].add_(
+                    beta_abs_over_self_mass[:, token_mask].double().sum(dim=-1)
+                )
+                self.beta_minus_self_mass_sum[layer_idx, :, bucket_idx].add_(
+                    beta_minus_self_mass[:, token_mask].double().sum(dim=-1)
+                )
+                self.diag_removed_frac_sum[layer_idx, :, bucket_idx].add_(
+                    diag_removed_frac[:, token_mask].double().sum(dim=-1)
+                )
+                self.context_parallel_removed_frac_sum[layer_idx, :, bucket_idx].add_(
+                    context_parallel_removed_frac[:, token_mask].double().sum(dim=-1)
+                )
+
+    def sync_distributed(self):
+        if dist.is_initialized():
+            for tensor in (
+                self.count, self.self_mass_sum, self.beta_sum, self.beta_abs_sum, self.beta_sq_sum,
+                self.beta_positive_sum, self.beta_abs_gt_self_mass_sum, self.beta_abs_over_self_mass_sum,
+                self.beta_minus_self_mass_sum, self.diag_removed_frac_sum,
+                self.context_parallel_removed_frac_sum,
+            ):
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    def as_numpy(self):
+        den = self.count.clamp_min(1)
+        data = {
+            "bucket_names": np.array(self.bucket_names),
+            "count": self.count.detach().cpu().numpy(),
+            "self_mass": (self.self_mass_sum / den).detach().cpu().numpy(),
+            "beta_mean": (self.beta_sum / den).detach().cpu().numpy(),
+            "beta_abs_mean": (self.beta_abs_sum / den).detach().cpu().numpy(),
+            "beta_rms": (self.beta_sq_sum / den).sqrt().detach().cpu().numpy(),
+            "beta_positive_frac": (self.beta_positive_sum / den).detach().cpu().numpy(),
+            "beta_abs_gt_self_mass_frac": (self.beta_abs_gt_self_mass_sum / den).detach().cpu().numpy(),
+            "beta_abs_over_self_mass": (self.beta_abs_over_self_mass_sum / den).detach().cpu().numpy(),
+            "beta_minus_self_mass": (self.beta_minus_self_mass_sum / den).detach().cpu().numpy(),
+            "diag_removed_frac": (self.diag_removed_frac_sum / den).detach().cpu().numpy(),
+            "context_parallel_removed_frac": (self.context_parallel_removed_frac_sum / den).detach().cpu().numpy(),
+        }
+        empty = data["count"] == 0
+        for name in (
+            "self_mass", "beta_mean", "beta_abs_mean", "beta_rms", "beta_positive_frac",
+            "beta_abs_gt_self_mass_frac", "beta_abs_over_self_mass", "beta_minus_self_mass",
+            "diag_removed_frac", "context_parallel_removed_frac",
+        ):
+            data[name][empty] = np.nan
+        return data
+
+
+xsa_beta_diag_recorder: XSABetaDiagRecorder | None = None
+
+
 LOSS_SLICE_DISTANCE_BINS = (
     ("none", -1, -1),
     ("1_16", 1, 16),
@@ -1621,6 +1774,105 @@ class XSALossSliceRecorder:
         return data
 
 
+@dataclass(slots=True)
+class XSAInterventionConfig:
+    name: str
+    kind: str
+    strength: float = 0.0
+    diag_mass: float = 0.0
+    layers: tuple[int, ...] | None = None
+    token_filter: str = "all"
+    apply_learned_xsa_after: bool = False
+
+
+xsa_intervention_config: XSAInterventionConfig | None = None
+
+
+def _parse_xsa_intervention_layers(spec: str) -> tuple[int, ...] | None:
+    spec = spec.strip().lower()
+    if spec in ("all", "*"):
+        return None
+    layers = tuple(int(part) for part in spec.replace(",", " ").split() if part)
+    if not layers:
+        raise ValueError(f"Empty XSA intervention layer spec {spec!r}")
+    return layers
+
+
+def _xsa_intervention_layer_label(layers: tuple[int, ...] | None) -> str:
+    if layers is None:
+        return "all"
+    return "-".join(str(layer) for layer in layers)
+
+
+def _xsa_float_label(value: float) -> str:
+    return f"{value:g}".replace("-", "m").replace(".", "p")
+
+
+def build_xsa_intervention_suite():
+    conditions: list[XSAInterventionConfig | None] = [None]
+    conditions.append(XSAInterventionConfig(name="no_xsa_all", kind="no-xsa", layers=None))
+    token_filters = args.xsa_intervention_token_filters
+    layer_specs = args.xsa_intervention_layers
+    layer_items = [(spec, _parse_xsa_intervention_layers(spec)) for spec in layer_specs]
+    for layer_spec, layers in layer_items:
+        layer_label = _xsa_intervention_layer_label(layers)
+        for token_filter in token_filters:
+            filter_suffix = "" if token_filter == "all" else f"_{token_filter.replace('-', '_')}"
+            for diag_mass in args.xsa_intervention_diag_masses:
+                conditions.append(XSAInterventionConfig(
+                    name=f"force_diag_c{_xsa_float_label(diag_mass)}_L{layer_label}{filter_suffix}",
+                    kind="force-diag",
+                    diag_mass=diag_mass,
+                    layers=layers,
+                    token_filter=token_filter,
+                    apply_learned_xsa_after=True,
+                ))
+            for strength in args.xsa_intervention_strengths:
+                strength_label = _xsa_float_label(strength)
+                conditions.extend([
+                    XSAInterventionConfig(
+                        name=f"diag_remove_g{strength_label}_L{layer_label}{filter_suffix}",
+                        kind="diag-remove",
+                        strength=strength,
+                        layers=layers,
+                        token_filter=token_filter,
+                    ),
+                    XSAInterventionConfig(
+                        name=f"context_remove_g{strength_label}_L{layer_label}{filter_suffix}",
+                        kind="context-remove",
+                        strength=strength,
+                        layers=layers,
+                        token_filter=token_filter,
+                    ),
+                    XSAInterventionConfig(
+                        name=f"diag_addback_e{strength_label}_L{layer_label}{filter_suffix}",
+                        kind="diag-addback",
+                        strength=strength,
+                        layers=layers,
+                        token_filter=token_filter,
+                    ),
+                    XSAInterventionConfig(
+                        name=f"context_addback_e{strength_label}_L{layer_label}{filter_suffix}",
+                        kind="context-addback",
+                        strength=strength,
+                        layers=layers,
+                        token_filter=token_filter,
+                    ),
+                ])
+            conditions.append(XSAInterventionConfig(
+                name=f"shuffle_proj_g1_L{layer_label}{filter_suffix}",
+                kind="shuffle-proj",
+                strength=1.0,
+                layers=layers,
+                token_filter=token_filter,
+            ))
+    return conditions
+
+
+def xsa_intervention_condition_names(conditions: list[XSAInterventionConfig | None]):
+    return tuple("baseline_record" if condition is None else condition.name for condition in conditions)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
@@ -1631,6 +1883,119 @@ class CausalSelfAttention(nn.Module):
         self.paired = paired
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
+
+    def _intervention_applies(self, layer_idx: int):
+        condition = xsa_intervention_config
+        if condition is None or self.paired:
+            return None
+        if condition.layers is not None and layer_idx not in condition.layers:
+            return None
+        return condition
+
+    def _apply_record_xsa(self, y: Tensor, v: Tensor, xsa_alpha: Tensor | None):
+        if xsa_alpha is None:
+            return y
+        vn = F.normalize(v, dim=-1, eps=1e-4)
+        proj = (y * vn).sum(-1, keepdim=True)
+        alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
+        return y - alpha * proj * vn
+
+    def _apply_record_xsa_segment(self, y: Tensor, v: Tensor, xsa_alpha: Tensor | None):
+        if xsa_alpha is None:
+            return y
+        vn = F.normalize(v, dim=-1, eps=1e-4)
+        proj = (y * vn).sum(-1, keepdim=True)
+        alpha = torch.tanh(xsa_alpha).type_as(y).view(self.num_heads, 1, 1)
+        return y - alpha * proj * vn
+
+    def _intervention_token_mask(self, condition: XSAInterventionConfig, diag: Tensor,
+                                 context_proj: Tensor, y_seg: Tensor, v_seg: Tensor):
+        if condition.token_filter == "all":
+            return None
+        y_norm_sq = y_seg.square().sum(dim=-1).clamp_min(1e-12)
+        v_norm_sq = v_seg.square().sum(dim=-1).clamp_min(1e-12)
+        if condition.token_filter == "high-self":
+            score = diag
+        elif condition.token_filter == "high-context":
+            score = (context_proj * context_proj).sum(dim=-1) / y_norm_sq
+        elif condition.token_filter == "high-aligned":
+            dot_y_v = (y_seg * v_seg).sum(dim=-1)
+            score = dot_y_v.square() / (y_norm_sq * v_norm_sq)
+        else:
+            raise ValueError(f"Unsupported XSA intervention token filter {condition.token_filter!r}")
+        threshold = torch.quantile(score.flatten().float(), args.xsa_intervention_quantile)
+        return score >= threshold
+
+    def _explicit_attention_intervention(self, q: Tensor, k: Tensor, v: Tensor, seqlens: Tensor,
+                                         bm_size: int, attn_scale: float,
+                                         condition: XSAInterventionConfig, xsa_alpha: Tensor | None):
+        output_dtype = v.dtype
+        q = q[0].float()
+        k = k[0].float()
+        v = v[0].float()
+        y_out = torch.empty_like(v)
+        boundaries = [int(x) for x in seqlens.detach().cpu().tolist()]
+        boundaries = [x for x in boundaries if 0 <= x <= q.size(0)]
+        if not boundaries or boundaries[0] != 0:
+            boundaries = [0, *boundaries]
+        if boundaries[-1] != q.size(0):
+            boundaries.append(q.size(0))
+
+        for start, end in pairwise(boundaries):
+            if end <= start:
+                continue
+            q_seg = q[start:end].transpose(0, 1)
+            k_seg = k[start:end].transpose(0, 1)
+            v_seg = v[start:end].transpose(0, 1)
+            length = end - start
+            scores = torch.matmul(q_seg, k_seg.transpose(-1, -2)) * attn_scale
+            row = torch.arange(length, device=device).view(length, 1)
+            col = torch.arange(length, device=device).view(1, length)
+            mask = col <= row
+            if bm_size is not None:
+                mask = mask & (col >= row - int(bm_size))
+            scores = scores.masked_fill(~mask.view(1, length, length), -torch.inf)
+            attn = torch.softmax(scores, dim=-1)
+            y_seg = torch.matmul(attn, v_seg)
+            diag_idx = torch.arange(length, device=device)
+            diag = attn.diagonal(dim1=-2, dim2=-1)
+            diag_value = diag.unsqueeze(-1) * v_seg
+            attn_context = attn.clone()
+            attn_context[:, diag_idx, diag_idx] = 0.0
+            context_value = torch.matmul(attn_context, v_seg)
+            v_norm_sq = v_seg.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            context_proj = ((context_value * v_seg).sum(dim=-1, keepdim=True) / v_norm_sq) * v_seg
+
+            if condition.kind == "force-diag":
+                context_den = attn_context.sum(dim=-1, keepdim=True)
+                attn_context_norm = attn_context / context_den.clamp_min(1e-12)
+                attn_context_norm = torch.where(context_den > 0, attn_context_norm, torch.zeros_like(attn_context_norm))
+                y_mod = (1.0 - condition.diag_mass) * torch.matmul(attn_context_norm, v_seg) + condition.diag_mass * v_seg
+            elif condition.kind == "diag-remove":
+                y_mod = y_seg - condition.strength * diag_value
+            elif condition.kind == "context-remove":
+                y_mod = y_seg - condition.strength * context_proj
+            elif condition.kind == "diag-addback":
+                y_mod = self._apply_record_xsa_segment(y_seg, v_seg, xsa_alpha)
+                y_mod = y_mod + condition.strength * diag_value
+            elif condition.kind == "context-addback":
+                y_mod = self._apply_record_xsa_segment(y_seg, v_seg, xsa_alpha)
+                y_mod = y_mod + condition.strength * context_proj
+            elif condition.kind == "shuffle-proj":
+                shuffled_v = torch.roll(v_seg, shifts=args.xsa_intervention_shuffle_shift, dims=1)
+                if length > 1:
+                    shuffled_v[:, :args.xsa_intervention_shuffle_shift] = v_seg[:, :args.xsa_intervention_shuffle_shift]
+                shuffled_norm_sq = shuffled_v.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                shuffled_proj = ((y_seg * shuffled_v).sum(dim=-1, keepdim=True) / shuffled_norm_sq) * shuffled_v
+                y_mod = y_seg - condition.strength * shuffled_proj
+            else:
+                raise ValueError(f"Unsupported XSA intervention kind {condition.kind!r}")
+
+            token_mask = self._intervention_token_mask(condition, diag, context_proj, y_seg, v_seg)
+            if token_mask is not None:
+                y_mod = torch.where(token_mask.unsqueeze(-1), y_mod, y_seg)
+            y_out[start:end] = y_mod.transpose(0, 1).to(y_out.dtype)
+        return y_out.unsqueeze(0).to(dtype=output_dtype)
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -1677,26 +2042,52 @@ class CausalSelfAttention(nn.Module):
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
+        intervention = self._intervention_applies(attn_args.layer_idx)
+        explicit_intervention_kinds = {
+            "force-diag",
+            "diag-remove",
+            "context-remove",
+            "diag-addback",
+            "context-addback",
+            "shuffle-proj",
+        }
+        intervention_handles_xsa = intervention is not None and intervention.kind in {
+            "no-xsa",
+            "diag-remove",
+            "context-remove",
+            "diag-addback",
+            "context-addback",
+            "shuffle-proj",
+        }
+        if intervention is not None and intervention.kind in explicit_intervention_kinds:
+            y = self._explicit_attention_intervention(
+                q,
+                k,
+                v,
+                seqlens,
+                bm_size,
+                yarn.attn_scale,
+                intervention,
+                attn_args.xsa_alpha,
+            )
+        else:
+            # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
         y_raw = y
         # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
         # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
-        if args.xsa_mode == "record" and attn_args.xsa_alpha is not None and not self.paired:
-            vn = F.normalize(v, dim=-1, eps=1e-4)
-            proj = (y * vn).sum(-1, keepdim=True)
-            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
-            y = y - alpha * proj * vn
-        elif args.xsa_mode == "value" and not self.paired:
+        if args.xsa_mode == "record" and attn_args.xsa_alpha is not None and not self.paired and not intervention_handles_xsa:
+            y = self._apply_record_xsa(y, v, attn_args.xsa_alpha)
+        elif args.xsa_mode == "value" and not self.paired and not intervention_handles_xsa:
             y_f = y.float()
             v_f = v.float()
             numer = (y_f * v_f).sum(dim=-1, keepdim=True)
             denom = v_f.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
             y = (y_f - args.model_xsa_lambda * (numer / denom) * v_f).to(y.dtype)
-        elif args.xsa_mode == "output-metric-diag" and attn_args.xsa_alpha is not None and not self.paired:
+        elif args.xsa_mode == "output-metric-diag" and attn_args.xsa_alpha is not None and not self.paired and not intervention_handles_xsa:
             if args.output_metric_detach and args.output_metric_bf16_projection:
                 with torch.no_grad():
                     metric_diag = qkvo_w[self.dim * 3:].float().square().sum(dim=0)
@@ -1719,7 +2110,10 @@ class CausalSelfAttention(nn.Module):
                 alpha = torch.tanh(attn_args.xsa_alpha).float().view(1, 1, self.num_heads, 1)
                 y = (y_f - alpha * (numer / denom) * v_f).to(y.dtype)
         y_post_head_xsa = y
-        attn_gate = torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        if args.disable_attn_gate:
+            attn_gate = torch.ones((B, T, self.num_heads, 1), device=x.device, dtype=y.dtype)
+        else:
+            attn_gate = torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y_gated = y * attn_gate
         y = y_gated.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         wo_w = qkvo_w[self.dim * 3:].type_as(y)
@@ -1747,6 +2141,17 @@ class CausalSelfAttention(nn.Module):
                 y_raw,
                 y_gated,
                 attn_gate,
+                seqlens,
+                bm_size,
+                yarn.attn_scale,
+            )
+        if xsa_beta_diag_recorder is not None and not self.paired:
+            xsa_beta_diag_recorder.record(
+                attn_args.layer_idx,
+                q,
+                k,
+                v,
+                y_raw,
                 seqlens,
                 bm_size,
                 yarn.attn_scale,
@@ -2068,9 +2473,9 @@ class GPT(nn.Module):
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
             if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                x = mu[12] * x + mu[13] * relu_squared_mlp(norm(x), c_fc, c_proj)
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * relu_squared_mlp(norm(x), c_fc, c_proj)
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -2314,6 +2719,7 @@ class Hyperparameters:
     checkpoint_dir: str = os.environ.get("CHECKPOINT_DIR", os.path.join(log_dir, "checkpoints"))
     load_checkpoint: str | None = os.environ.get("LOAD_CHECKPOINT")
     load_optimizer: bool = os.environ.get("LOAD_OPTIMIZER", "0").lower() in ("1", "true", "yes")
+    train_steps_override: int | None = int(os.environ["TRAIN_STEPS"]) if "TRAIN_STEPS" in os.environ else None
     max_train_steps: int | None = int(os.environ["MAX_TRAIN_STEPS"]) if "MAX_TRAIN_STEPS" in os.environ else None
     skip_warmup: bool = os.environ.get("SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
     skip_validation: bool = os.environ.get("SKIP_VALIDATION", "0").lower() in ("1", "true", "yes")
@@ -2321,7 +2727,9 @@ class Hyperparameters:
     model_xsa_lambda: float = float(os.environ.get("MODEL_XSA_LAMBDA", "1.0"))
     output_metric_detach: bool = os.environ.get("OUTPUT_METRIC_DETACH", "0").lower() in ("1", "true", "yes")
     output_metric_bf16_projection: bool = os.environ.get("OUTPUT_METRIC_BF16_PROJECTION", "0").lower() in ("1", "true", "yes")
+    disable_attn_gate: bool = os.environ.get("DISABLE_ATTN_GATE", "0").lower() in ("1", "true", "yes")
     xsa_interp: bool = os.environ.get("XSA_INTERP", "0").lower() in ("1", "true", "yes")
+    post_train_xsa_interp: bool = os.environ.get("POST_TRAIN_XSA_INTERP", "0").lower() in ("1", "true", "yes")
     xsa_interp_tests: tuple[str, ...] = tuple(s for s in os.environ.get("XSA_INTERP_TESTS", "alignment").replace(",", " ").split())
     xsa_interp_modes: tuple[str, ...] = tuple(s.replace("_", "-") for s in os.environ.get(
         "XSA_INTERP_MODES",
@@ -2332,6 +2740,20 @@ class Hyperparameters:
     xsa_interp_dir: str = os.environ.get("XSA_INTERP_DIR", "xsa_interp_logs")
     xsa_interp_step: int | None = int(os.environ["XSA_INTERP_STEP"]) if "XSA_INTERP_STEP" in os.environ else None
     xsa_interp_final_ws: bool = os.environ.get("XSA_INTERP_FINAL_WS", "1").lower() in ("1", "true", "yes")
+    xsa_intervention_layers: tuple[str, ...] = tuple(
+        s for s in os.environ.get("XSA_INTERVENTION_LAYERS", "all 3 4 7 8").replace(",", " ").split()
+    )
+    xsa_intervention_strengths: tuple[float, ...] = tuple(
+        float(s) for s in os.environ.get("XSA_INTERVENTION_STRENGTHS", "0.5 1.0").replace(",", " ").split()
+    )
+    xsa_intervention_diag_masses: tuple[float, ...] = tuple(
+        float(s) for s in os.environ.get("XSA_INTERVENTION_DIAG_MASSES", "0 0.2 0.4").replace(",", " ").split()
+    )
+    xsa_intervention_token_filters: tuple[str, ...] = tuple(
+        s.replace("_", "-") for s in os.environ.get("XSA_INTERVENTION_TOKEN_FILTERS", "all").replace(",", " ").split()
+    )
+    xsa_intervention_quantile: float = float(os.environ.get("XSA_INTERVENTION_QUANTILE", "0.9"))
+    xsa_intervention_shuffle_shift: int = int(os.environ.get("XSA_INTERVENTION_SHUFFLE_SHIFT", "1"))
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -2345,6 +2767,7 @@ def apply_cli_overrides(args: Hyperparameters):
 
     parser = argparse.ArgumentParser(description="Train modded-nanogpt")
     parser.add_argument("--max-train-steps", type=int, default=None, help="Cap optimizer steps; 1 runs one training step then exits.")
+    parser.add_argument("--train-steps", type=int, default=None, help="Override total optimizer steps, extending at final schedule settings if needed.")
     parser.add_argument("--skip-warmup", nargs="?", const=True, default=None, type=bool_arg, help="Skip the multi-shape compilation warmup.")
     parser.add_argument("--skip-validation", nargs="?", const=True, default=None, type=bool_arg, help="Skip validation passes, including final validation.")
     parser.add_argument("--val-loss-every", type=int, default=None, help="Override validation cadence; 0 disables periodic validation.")
@@ -2367,8 +2790,14 @@ def apply_cli_overrides(args: Hyperparameters):
                         help="Use bf16 arithmetic for detached output-metric-diag token projections.")
     parser.add_argument("--no-output-metric-bf16-projection", dest="output_metric_bf16_projection", action="store_false",
                         help="Use fp32 arithmetic for output-metric-diag token projections.")
+    parser.add_argument("--disable-attn-gate", dest="disable_attn_gate", action="store_true", default=None,
+                        help="Ablation: replace sparse attention gate activations with ones.")
+    parser.add_argument("--enable-attn-gate", dest="disable_attn_gate", action="store_false",
+                        help="Use the learned sparse attention gate activations.")
     parser.add_argument("--xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
                         help="Run XSA geometry interpretation on validation batches, save metrics, plot, and exit.")
+    parser.add_argument("--post-train-xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
+                        help="Run XSA interpretation after the training loop finishes, without requiring a checkpoint reload.")
     parser.add_argument("--xsa-interp-tests", default=None,
                         help="Comma- or space-separated interp tests to run. Supported: alignment, loss-slices, attention-diagnostics.")
     parser.add_argument("--xsa-interp-modes", default=None,
@@ -2383,10 +2812,24 @@ def apply_cli_overrides(args: Hyperparameters):
                         help="Schedule step to use for XSA interp. Defaults to loaded checkpoint step when available, else 0.")
     parser.add_argument("--xsa-interp-final-ws", nargs="?", const=True, default=None, type=bool_arg,
                         help="Use final validation window extension during XSA interp.")
+    parser.add_argument("--xsa-intervention-layers", default=None,
+                        help="Layer specs for causal interventions, e.g. 'all 3 4 7 8'.")
+    parser.add_argument("--xsa-intervention-strengths", default=None,
+                        help="Strengths for remove/addback interventions, e.g. '0.5 1.0'.")
+    parser.add_argument("--xsa-intervention-diag-masses", default=None,
+                        help="Forced diagonal masses for force-diag interventions, e.g. '0 0.2 0.4'.")
+    parser.add_argument("--xsa-intervention-token-filters", default=None,
+                        help="Token filters for interventions. Supported: all, high-self, high-context, high-aligned.")
+    parser.add_argument("--xsa-intervention-quantile", type=float, default=None,
+                        help="Quantile threshold for high-* token filters.")
+    parser.add_argument("--xsa-intervention-shuffle-shift", type=int, default=None,
+                        help="Within-sequence value shift for shuffled projection controls.")
     cli_args, _ = parser.parse_known_args()
 
     if cli_args.max_train_steps is not None:
         args.max_train_steps = cli_args.max_train_steps
+    if cli_args.train_steps is not None:
+        args.train_steps_override = cli_args.train_steps
     if cli_args.skip_warmup is not None:
         args.skip_warmup = cli_args.skip_warmup
     if cli_args.skip_validation is not None:
@@ -2413,8 +2856,12 @@ def apply_cli_overrides(args: Hyperparameters):
         args.output_metric_detach = cli_args.output_metric_detach
     if cli_args.output_metric_bf16_projection is not None:
         args.output_metric_bf16_projection = cli_args.output_metric_bf16_projection
+    if cli_args.disable_attn_gate is not None:
+        args.disable_attn_gate = cli_args.disable_attn_gate
     if cli_args.xsa_interp is not None:
         args.xsa_interp = cli_args.xsa_interp
+    if cli_args.post_train_xsa_interp is not None:
+        args.post_train_xsa_interp = cli_args.post_train_xsa_interp
     if cli_args.xsa_interp_tests is not None:
         args.xsa_interp_tests = tuple(s for s in cli_args.xsa_interp_tests.replace(",", " ").split())
     if cli_args.xsa_interp_modes is not None:
@@ -2429,6 +2876,18 @@ def apply_cli_overrides(args: Hyperparameters):
         args.xsa_interp_step = cli_args.xsa_interp_step
     if cli_args.xsa_interp_final_ws is not None:
         args.xsa_interp_final_ws = cli_args.xsa_interp_final_ws
+    if cli_args.xsa_intervention_layers is not None:
+        args.xsa_intervention_layers = tuple(s for s in cli_args.xsa_intervention_layers.replace(",", " ").split())
+    if cli_args.xsa_intervention_strengths is not None:
+        args.xsa_intervention_strengths = tuple(float(s) for s in cli_args.xsa_intervention_strengths.replace(",", " ").split())
+    if cli_args.xsa_intervention_diag_masses is not None:
+        args.xsa_intervention_diag_masses = tuple(float(s) for s in cli_args.xsa_intervention_diag_masses.replace(",", " ").split())
+    if cli_args.xsa_intervention_token_filters is not None:
+        args.xsa_intervention_token_filters = tuple(s.replace("_", "-") for s in cli_args.xsa_intervention_token_filters.replace(",", " ").split())
+    if cli_args.xsa_intervention_quantile is not None:
+        args.xsa_intervention_quantile = cli_args.xsa_intervention_quantile
+    if cli_args.xsa_intervention_shuffle_shift is not None:
+        args.xsa_intervention_shuffle_shift = cli_args.xsa_intervention_shuffle_shift
 
     supported_xsa_modes = ("record", "none", "value", "output-metric-diag")
     if args.xsa_mode not in supported_xsa_modes:
@@ -2436,17 +2895,35 @@ def apply_cli_overrides(args: Hyperparameters):
     unsupported_interp_modes = tuple(mode for mode in args.xsa_interp_modes if mode not in supported_xsa_modes)
     if unsupported_interp_modes:
         raise ValueError(f"Unsupported XSA_INTERP_MODES entries: {unsupported_interp_modes}")
-    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices", "attention-diagnostics"))
+    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices", "attention-diagnostics", "causal-interventions", "beta-diagnostics"))
     if unsupported_interp_tests:
         raise ValueError(f"Unsupported XSA_INTERP_TESTS entries: {unsupported_interp_tests}")
     if args.xsa_interp and not args.xsa_interp_tests:
         raise ValueError("XSA_INTERP_TESTS must include at least one test when XSA_INTERP is enabled")
     if args.xsa_interp and any(test in args.xsa_interp_tests for test in ("alignment", "loss-slices", "attention-diagnostics")) and not args.xsa_interp_modes:
         raise ValueError("XSA_INTERP_MODES must include at least one mode when alignment, loss-slices, or attention-diagnostics interp is enabled")
+    unsupported_token_filters = tuple(
+        token_filter for token_filter in args.xsa_intervention_token_filters
+        if token_filter not in ("all", "high-self", "high-context", "high-aligned")
+    )
+    if unsupported_token_filters:
+        raise ValueError(f"Unsupported XSA intervention token filters: {unsupported_token_filters}")
+    if not args.xsa_intervention_layers:
+        raise ValueError("XSA_INTERVENTION_LAYERS must include at least one layer spec")
+    if not args.xsa_intervention_strengths:
+        raise ValueError("XSA_INTERVENTION_STRENGTHS must include at least one value")
+    if not args.xsa_intervention_diag_masses:
+        raise ValueError("XSA_INTERVENTION_DIAG_MASSES must include at least one value")
+    if not (0.0 < args.xsa_intervention_quantile < 1.0):
+        raise ValueError("XSA_INTERVENTION_QUANTILE must be between 0 and 1")
+    if args.xsa_intervention_shuffle_shift <= 0:
+        raise ValueError("XSA_INTERVENTION_SHUFFLE_SHIFT must be positive")
     if not math.isfinite(args.model_xsa_lambda):
         raise ValueError(f"MODEL_XSA_LAMBDA must be finite, got {args.model_xsa_lambda}")
     if any(step < 0 for step in args.extra_val_steps):
         raise ValueError(f"EXTRA_VAL_STEPS must be nonnegative, got {args.extra_val_steps}")
+    if args.train_steps_override is not None and args.train_steps_override < 0:
+        raise ValueError(f"TRAIN_STEPS must be nonnegative, got {args.train_steps_override}")
     if args.xsa_interp_step is not None and args.xsa_interp_step < 0:
         raise ValueError(f"XSA_INTERP_STEP must be nonnegative, got {args.xsa_interp_step}")
     if args.load_optimizer and args.load_checkpoint is None:
@@ -2548,7 +3025,7 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         frac = step / muon_warmup_steps
         momentum = momentum_min + frac * (momentum_max - momentum_min)
     elif step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / muon_cooldown_steps
+        frac = min(1.0, (step - momentum_cd_start) / muon_cooldown_steps)
         momentum = momentum_max - frac * (momentum_max - momentum_min)
     else:
         momentum = momentum_max
@@ -2673,7 +3150,7 @@ class TrainingManager():
             self.train_loader_send_args = None
 
         self.ws_long = new_ws_long
-        self.mtp_weights = training_schedule.mtp_weights[step]
+        self.mtp_weights = training_schedule.mtp_weights[min(step, len(training_schedule.mtp_weights) - 1)]
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
@@ -2790,6 +3267,7 @@ print0(f"Log dir: {args.log_dir}")
 print0(f"Checkpoint dir: {args.checkpoint_dir}")
 print0(f"Load checkpoint: {args.load_checkpoint}")
 print0(f"Load optimizer: {args.load_optimizer}")
+print0(f"Train steps override: {args.train_steps_override}")
 print0(f"Max train steps: {args.max_train_steps}")
 print0(f"Skip warmup: {args.skip_warmup}")
 print0(f"Skip validation: {args.skip_validation}")
@@ -2798,7 +3276,9 @@ print0(f"XSA mode: {args.xsa_mode}")
 print0(f"Model XSA lambda: {args.model_xsa_lambda}")
 print0(f"Output metric detach: {args.output_metric_detach}")
 print0(f"Output metric bf16 projection: {args.output_metric_bf16_projection}")
+print0(f"Disable attention gate: {args.disable_attn_gate}")
 print0(f"XSA interp: {args.xsa_interp}")
+print0(f"Post-train XSA interp: {args.post_train_xsa_interp}")
 print0(f"XSA interp tests: {args.xsa_interp_tests}")
 print0(f"XSA interp modes: {args.xsa_interp_modes}")
 print0(f"XSA interp batches: {args.xsa_interp_batches}")
@@ -2892,10 +3372,14 @@ if loaded_checkpoint is not None:
     del loaded_checkpoint
     gc.collect()
 
+completed_train_step: int | None = None
+
 
 def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn):
-    global xsa_interp_recorder, xsa_attention_diag_recorder
+    global xsa_interp_active
+    global xsa_interp_recorder, xsa_attention_diag_recorder, xsa_beta_diag_recorder, xsa_intervention_config
     original_xsa_mode = args.xsa_mode
+    xsa_interp_active = True
     print_fn(
         f"Running XSA interp tests {args.xsa_interp_tests} for {args.xsa_interp_batches} validation batch(es) "
         f"of {args.xsa_interp_batch_size} total tokens",
@@ -2903,7 +3387,11 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
     )
     interp_step = args.xsa_interp_step
     if interp_step is None:
-        interp_step = loaded_checkpoint_step if loaded_checkpoint_step is not None else 0
+        interp_step = (
+            loaded_checkpoint_step if loaded_checkpoint_step is not None
+            else completed_train_step if completed_train_step is not None
+            else 0
+        )
     schedule_step = min(interp_step, len(training_schedule.mtp_weights) - 1)
     if schedule_step != interp_step:
         print_fn(
@@ -2944,6 +3432,7 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
                 data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
@@ -3009,6 +3498,7 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
                 data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
@@ -3044,6 +3534,7 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
                 data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
@@ -3063,10 +3554,129 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 npz_path, svg_path = save_xsa_attention_diag_sweep_outputs(attention_results, args.xsa_interp_dir, args.run_id)
                 print_fn(f"Saved XSA attention diagnostics sweep metrics: {npz_path}", console=True)
                 print_fn(f"Saved XSA attention diagnostics sweep plot: {svg_path}", console=True)
+
+        if "beta-diagnostics" in args.xsa_interp_tests:
+            print_fn("Running XSA beta diagnostics with xsa_mode=record", console=True)
+            args.xsa_mode = "record"
+            token_class_masks = _build_token_class_masks(model.vocab_size)
+            beta_recorder = None
+            val_loader = distributed_data_generator(
+                args.val_files,
+                args.xsa_interp_batch_size,
+                -1,
+                grad_accum_steps=grad_accum_steps,
+                align_to_bos=False,
+            )
+            with torch.no_grad():
+                for _ in range(args.xsa_interp_batches):
+                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                    bucket_masks = _loss_slice_bucket_masks(
+                        inputs.detach().cpu().numpy(),
+                        targets.detach().cpu().numpy(),
+                        cum_seqlens.detach().cpu().numpy(),
+                        model.vocab_size,
+                        token_class_masks,
+                    )
+                    if beta_recorder is None:
+                        beta_recorder = XSABetaDiagRecorder(
+                            num_layers=11,
+                            num_heads=6,
+                            bucket_names=[name for name, _ in bucket_masks],
+                        )
+                    xsa_beta_diag_recorder = beta_recorder
+                    beta_recorder.set_bucket_masks(bucket_masks)
+                    model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+            del val_loader
+            xsa_beta_diag_recorder = None
+            if beta_recorder is not None:
+                beta_recorder.sync_distributed()
+                data = beta_recorder.as_numpy()
+                data["interp_test"] = np.array("beta-diagnostics")
+                data["xsa_mode"] = np.array("record")
+                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
+                data["xsa_interp_schedule_step"] = np.array(schedule_step)
+                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+                if master_process:
+                    from xsa_interp import save_xsa_beta_diag_outputs
+
+                    npz_path, svg_path = save_xsa_beta_diag_outputs(data, args.xsa_interp_dir, args.run_id)
+                    print_fn(f"Saved XSA beta diagnostics metrics: {npz_path}", console=True)
+                    print_fn(f"Saved XSA beta diagnostics plot: {svg_path}", console=True)
+
+        if "causal-interventions" in args.xsa_interp_tests:
+            print_fn("Running XSA causal intervention interp on the trained checkpoint behavior", console=True)
+            conditions = build_xsa_intervention_suite()
+            condition_names = xsa_intervention_condition_names(conditions)
+            print_fn(f"Evaluating {len(conditions)} causal intervention condition(s)", console=True)
+            token_class_masks = _build_token_class_masks(model.vocab_size)
+            causal_recorder = None
+            val_loader = distributed_data_generator(
+                args.val_files,
+                args.xsa_interp_batch_size,
+                -1,
+                grad_accum_steps=grad_accum_steps,
+                align_to_bos=False,
+            )
+            with torch.no_grad():
+                for _ in range(args.xsa_interp_batches):
+                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                    bucket_masks = _loss_slice_bucket_masks(
+                        inputs.detach().cpu().numpy(),
+                        targets.detach().cpu().numpy(),
+                        cum_seqlens.detach().cpu().numpy(),
+                        model.vocab_size,
+                        token_class_masks,
+                    )
+                    if causal_recorder is None:
+                        causal_recorder = XSALossSliceRecorder(condition_names, [name for name, _ in bucket_masks])
+                    losses_by_condition = []
+                    for condition in conditions:
+                        xsa_intervention_config = condition
+                        args.xsa_mode = "record"
+                        losses_by_condition.append(
+                            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).detach()
+                        )
+                    causal_recorder.record(losses_by_condition, bucket_masks)
+            del val_loader
+            xsa_intervention_config = None
+            if causal_recorder is not None:
+                causal_recorder.sync_distributed()
+                data = causal_recorder.as_numpy()
+                data["interp_test"] = np.array("causal-interventions")
+                data["baseline_condition"] = np.array(condition_names[0])
+                data["condition_kind"] = np.array(["baseline" if c is None else c.kind for c in conditions])
+                data["condition_strength"] = np.array([0.0 if c is None else c.strength for c in conditions])
+                data["condition_diag_mass"] = np.array([0.0 if c is None else c.diag_mass for c in conditions])
+                data["condition_layers"] = np.array([
+                    "all" if c is None or c.layers is None else _xsa_intervention_layer_label(c.layers)
+                    for c in conditions
+                ])
+                data["condition_token_filter"] = np.array(["all" if c is None else c.token_filter for c in conditions])
+                data["condition_apply_learned_xsa_after"] = np.array([
+                    False if c is None else c.apply_learned_xsa_after for c in conditions
+                ])
+                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
+                data["xsa_interp_schedule_step"] = np.array(schedule_step)
+                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+                data["xsa_intervention_quantile"] = np.array(args.xsa_intervention_quantile)
+                data["xsa_intervention_shuffle_shift"] = np.array(args.xsa_intervention_shuffle_shift)
+                if master_process:
+                    from xsa_interp import save_xsa_causal_intervention_outputs
+
+                    npz_path, svg_path = save_xsa_causal_intervention_outputs(data, args.xsa_interp_dir, args.run_id)
+                    print_fn(f"Saved XSA causal intervention metrics: {npz_path}", console=True)
+                    print_fn(f"Saved XSA causal intervention plot: {svg_path}", console=True)
     finally:
         args.xsa_mode = original_xsa_mode
+        xsa_interp_active = False
         xsa_interp_recorder = None
         xsa_attention_diag_recorder = None
+        xsa_beta_diag_recorder = None
+        xsa_intervention_config = None
 
 
 if args.xsa_interp:
@@ -3134,6 +3744,9 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+if args.train_steps_override is not None:
+    train_steps = args.train_steps_override
+    print0(f"Overriding training loop to {train_steps} optimizer steps", console=True)
 if args.max_train_steps is not None:
     train_steps = min(train_steps, args.max_train_steps)
     print0(f"Capping training loop at {train_steps} optimizer steps", console=True)
@@ -3227,6 +3840,14 @@ for step in range(resume_step, train_steps + 1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     completed_since_start = step + 1 - resume_step
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/completed_since_start:.2f}ms", console=True)
+
+completed_train_step = train_steps
+
+if args.post_train_xsa_interp:
+    model.eval()
+    interp_model = getattr(model, "_orig_mod", model)
+    run_xsa_interp(interp_model, training_manager, print0)
+    model.train()
 
 if args.run_evals:
     model.eval()
