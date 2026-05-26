@@ -1,0 +1,4 @@
+/root/xsa_gate_ablation/.venv/bin/python
+/root/xsa_gate_ablation/.venv
+/opt/conda
+Linux-5.15.0-164-generic-x86_64-with-glibc2.35

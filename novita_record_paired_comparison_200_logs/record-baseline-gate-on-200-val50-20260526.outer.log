@@ -1,0 +1,2 @@
+==== BEGIN record-baseline-gate-on-200-val50-20260526 2026-05-26T17:52:21+00:00 script=train_gpt_record_baseline.py gate=--enable-attn-gate ====
+==== END record-baseline-gate-on-200-val50-20260526 2026-05-26T17:59:25+00:00 ====

@@ -1,0 +1,10 @@
+sys.path = [
+    '/root/xsa_gate_ablation',
+    '/opt/conda/lib/python311.zip',
+    '/opt/conda/lib/python3.11',
+    '/opt/conda/lib/python3.11/lib-dynload',
+    '/root/xsa_gate_ablation/.venv/lib/python3.11/site-packages',
+]
+USER_BASE: '/root/.local' (exists)
+USER_SITE: '/root/.local/lib/python3.11/site-packages' (exists)
+ENABLE_USER_SITE: False

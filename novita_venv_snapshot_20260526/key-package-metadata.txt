@@ -1,0 +1,54 @@
+Name: torch
+Version: 2.10.0+cu126
+Summary: Tensors and Dynamic neural networks in Python with strong GPU acceleration
+Home-page: https://pytorch.org
+Author: 
+Author-email: PyTorch Team <packages@pytorch.org>
+License: BSD-3-Clause
+Location: /root/xsa_gate_ablation/.venv/lib/python3.11/site-packages
+Requires: cuda-bindings, filelock, fsspec, jinja2, networkx, nvidia-cublas-cu12, nvidia-cuda-cupti-cu12, nvidia-cuda-nvrtc-cu12, nvidia-cuda-runtime-cu12, nvidia-cudnn-cu12, nvidia-cufft-cu12, nvidia-cufile-cu12, nvidia-curand-cu12, nvidia-cusolver-cu12, nvidia-cusparse-cu12, nvidia-cusparselt-cu12, nvidia-nccl-cu12, nvidia-nvjitlink-cu12, nvidia-nvshmem-cu12, nvidia-nvtx-cu12, sympy, triton, typing-extensions
+Required-by: 
+---
+Name: triton
+Version: 3.6.0
+Summary: A language and compiler for custom Deep Learning operations
+Home-page: https://github.com/triton-lang/triton/
+Author: Philippe Tillet
+Author-email: phil@openai.com
+License: 
+Location: /root/xsa_gate_ablation/.venv/lib/python3.11/site-packages
+Requires: 
+Required-by: torch
+---
+Name: kernels
+Version: 0.13.0
+Summary: Download compute kernels
+Home-page: 
+Author: 
+Author-email: Daniel de Kok <daniel@huggingface.co>, David Holtz <david@huggingface.co>
+License: Apache-2.0
+Location: /root/xsa_gate_ablation/.venv/lib/python3.11/site-packages
+Requires: huggingface_hub, packaging, pyyaml, tomlkit
+Required-by: 
+---
+Name: numpy
+Version: 2.4.6
+Summary: Fundamental package for array computing in Python
+Home-page: https://numpy.org
+Author: Travis E. Oliphant et al.
+Author-email: 
+License-Expression: BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
+Location: /root/xsa_gate_ablation/.venv/lib/python3.11/site-packages
+Requires: 
+Required-by: datasets, pandas
+---
+Name: huggingface_hub
+Version: 1.16.1
+Summary: Client library to download and publish models, datasets and other repos on the huggingface.co hub
+Home-page: https://github.com/huggingface/huggingface_hub
+Author: Hugging Face, Inc.
+Author-email: julien@huggingface.co
+License: Apache-2.0
+Location: /root/xsa_gate_ablation/.venv/lib/python3.11/site-packages
+Requires: filelock, fsspec, hf-xet, httpx, packaging, pyyaml, tqdm, typer, typing-extensions
+Required-by: datasets, kernels

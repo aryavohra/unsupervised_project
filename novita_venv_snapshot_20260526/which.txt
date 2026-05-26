@@ -1,0 +1,4 @@
+/root/xsa_gate_ablation/.venv/bin/python
+/root/xsa_gate_ablation/.venv/bin/python3
+/root/xsa_gate_ablation/.venv/bin/pip
+/root/xsa_gate_ablation/.venv/bin/torchrun

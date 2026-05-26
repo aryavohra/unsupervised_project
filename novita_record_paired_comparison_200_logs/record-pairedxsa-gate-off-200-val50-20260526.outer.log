@@ -1,0 +1,2 @@
+==== BEGIN record-pairedxsa-gate-off-200-val50-20260526 2026-05-26T18:12:24+00:00 script=train_gpt_record_paired.py gate=--disable-attn-gate ====
+==== END record-pairedxsa-gate-off-200-val50-20260526 2026-05-26T18:18:24+00:00 ====

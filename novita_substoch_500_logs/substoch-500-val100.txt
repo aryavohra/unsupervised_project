@@ -41,14 +41,6 @@ from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction,
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
-xsa_interp_active = False
-
-
-def relu_squared_mlp(x: Tensor, w1: Tensor, w2: Tensor):
-    if xsa_interp_active:
-        post = F.relu(F.linear(x.to(w1.dtype), w1)).square()
-        return post @ w2
-    return ReLUSqrdMLP(x, w1, w2)
 
 dynamo.config.recompile_limit = 64
 
@@ -1452,151 +1444,6 @@ class XSAAttentionDiagRecorder:
 xsa_attention_diag_recorder: XSAAttentionDiagRecorder | None = None
 
 
-class XSABetaDiagRecorder:
-    def __init__(self, num_layers: int, num_heads: int, bucket_names: list[str]):
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.bucket_names = tuple(bucket_names)
-        shape = (num_layers, num_heads, len(bucket_names))
-        self.count = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_abs_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_sq_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_positive_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_abs_gt_self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_abs_over_self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.beta_minus_self_mass_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.diag_removed_frac_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.context_parallel_removed_frac_sum = torch.zeros(shape, device=device, dtype=torch.float64)
-        self.bucket_masks: list[Tensor] | None = None
-
-    def set_bucket_masks(self, bucket_masks: list[tuple[str, np.ndarray]]):
-        names = tuple(name for name, _ in bucket_masks)
-        if names != self.bucket_names:
-            raise ValueError(f"Beta bucket names changed from {self.bucket_names} to {names}")
-        self.bucket_masks = [
-            torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
-            for _, mask_np in bucket_masks
-        ]
-
-    @torch.no_grad()
-    def record(self, layer_idx: int, q: Tensor, k: Tensor, v: Tensor, y_raw: Tensor,
-               seqlens: Tensor, bm_size: int, attn_scale: float):
-        if self.bucket_masks is None:
-            raise RuntimeError("XSABetaDiagRecorder bucket masks must be set before recording")
-        q = q[0].float()
-        k = k[0].float()
-        v = v[0].float()
-        y_raw = y_raw[0].float()
-        boundaries = [int(x) for x in seqlens.detach().cpu().tolist()]
-        boundaries = [x for x in boundaries if 0 <= x <= q.size(0)]
-        if not boundaries or boundaries[0] != 0:
-            boundaries = [0, *boundaries]
-        if boundaries[-1] != q.size(0):
-            boundaries.append(q.size(0))
-
-        for start, end in pairwise(boundaries):
-            if end <= start:
-                continue
-            q_seg = q[start:end].transpose(0, 1)
-            k_seg = k[start:end].transpose(0, 1)
-            v_seg = v[start:end].transpose(0, 1)
-            y_seg = y_raw[start:end].transpose(0, 1)
-            length = end - start
-            scores = torch.matmul(q_seg, k_seg.transpose(-1, -2)) * attn_scale
-            row = torch.arange(length, device=device).view(length, 1)
-            col = torch.arange(length, device=device).view(1, length)
-            mask = col <= row
-            if bm_size is not None:
-                mask = mask & (col >= row - int(bm_size))
-            scores = scores.masked_fill(~mask.view(1, length, length), -torch.inf)
-            attn = torch.softmax(scores, dim=-1)
-            diag = attn.diagonal(dim1=-2, dim2=-1)
-            diag_idx = torch.arange(length, device=device)
-            attn_context = attn.clone()
-            attn_context[:, diag_idx, diag_idx] = 0.0
-            context_value = torch.matmul(attn_context, v_seg)
-
-            v_norm_sq = v_seg.square().sum(dim=-1).clamp_min(1e-12)
-            y_norm_sq = y_seg.square().sum(dim=-1).clamp_min(1e-12)
-            dot_ctx_v = (context_value * v_seg).sum(dim=-1)
-            beta = dot_ctx_v / v_norm_sq
-            beta_abs = beta.abs()
-            beta_sq = beta.square()
-            beta_positive = beta > 0
-            beta_abs_gt_self_mass = beta_abs > diag
-            beta_abs_over_self_mass = beta_abs / diag.clamp_min(1e-6)
-            beta_minus_self_mass = beta - diag
-            diag_removed_frac = diag.square() * v_norm_sq / y_norm_sq
-            context_parallel_removed_frac = dot_ctx_v.square() / (v_norm_sq * y_norm_sq)
-
-            for bucket_idx, bucket_mask in enumerate(self.bucket_masks):
-                token_mask = bucket_mask[start:end]
-                if not token_mask.any():
-                    continue
-                bucket_count = token_mask.sum().to(torch.float64)
-                self.count[layer_idx, :, bucket_idx].add_(bucket_count)
-                self.self_mass_sum[layer_idx, :, bucket_idx].add_(diag[:, token_mask].double().sum(dim=-1))
-                self.beta_sum[layer_idx, :, bucket_idx].add_(beta[:, token_mask].double().sum(dim=-1))
-                self.beta_abs_sum[layer_idx, :, bucket_idx].add_(beta_abs[:, token_mask].double().sum(dim=-1))
-                self.beta_sq_sum[layer_idx, :, bucket_idx].add_(beta_sq[:, token_mask].double().sum(dim=-1))
-                self.beta_positive_sum[layer_idx, :, bucket_idx].add_(beta_positive[:, token_mask].double().sum(dim=-1))
-                self.beta_abs_gt_self_mass_sum[layer_idx, :, bucket_idx].add_(
-                    beta_abs_gt_self_mass[:, token_mask].double().sum(dim=-1)
-                )
-                self.beta_abs_over_self_mass_sum[layer_idx, :, bucket_idx].add_(
-                    beta_abs_over_self_mass[:, token_mask].double().sum(dim=-1)
-                )
-                self.beta_minus_self_mass_sum[layer_idx, :, bucket_idx].add_(
-                    beta_minus_self_mass[:, token_mask].double().sum(dim=-1)
-                )
-                self.diag_removed_frac_sum[layer_idx, :, bucket_idx].add_(
-                    diag_removed_frac[:, token_mask].double().sum(dim=-1)
-                )
-                self.context_parallel_removed_frac_sum[layer_idx, :, bucket_idx].add_(
-                    context_parallel_removed_frac[:, token_mask].double().sum(dim=-1)
-                )
-
-    def sync_distributed(self):
-        if dist.is_initialized():
-            for tensor in (
-                self.count, self.self_mass_sum, self.beta_sum, self.beta_abs_sum, self.beta_sq_sum,
-                self.beta_positive_sum, self.beta_abs_gt_self_mass_sum, self.beta_abs_over_self_mass_sum,
-                self.beta_minus_self_mass_sum, self.diag_removed_frac_sum,
-                self.context_parallel_removed_frac_sum,
-            ):
-                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
-    def as_numpy(self):
-        den = self.count.clamp_min(1)
-        data = {
-            "bucket_names": np.array(self.bucket_names),
-            "count": self.count.detach().cpu().numpy(),
-            "self_mass": (self.self_mass_sum / den).detach().cpu().numpy(),
-            "beta_mean": (self.beta_sum / den).detach().cpu().numpy(),
-            "beta_abs_mean": (self.beta_abs_sum / den).detach().cpu().numpy(),
-            "beta_rms": (self.beta_sq_sum / den).sqrt().detach().cpu().numpy(),
-            "beta_positive_frac": (self.beta_positive_sum / den).detach().cpu().numpy(),
-            "beta_abs_gt_self_mass_frac": (self.beta_abs_gt_self_mass_sum / den).detach().cpu().numpy(),
-            "beta_abs_over_self_mass": (self.beta_abs_over_self_mass_sum / den).detach().cpu().numpy(),
-            "beta_minus_self_mass": (self.beta_minus_self_mass_sum / den).detach().cpu().numpy(),
-            "diag_removed_frac": (self.diag_removed_frac_sum / den).detach().cpu().numpy(),
-            "context_parallel_removed_frac": (self.context_parallel_removed_frac_sum / den).detach().cpu().numpy(),
-        }
-        empty = data["count"] == 0
-        for name in (
-            "self_mass", "beta_mean", "beta_abs_mean", "beta_rms", "beta_positive_frac",
-            "beta_abs_gt_self_mass_frac", "beta_abs_over_self_mass", "beta_minus_self_mass",
-            "diag_removed_frac", "context_parallel_removed_frac",
-        ):
-            data[name][empty] = np.nan
-        return data
-
-
-xsa_beta_diag_recorder: XSABetaDiagRecorder | None = None
-
-
 LOSS_SLICE_DISTANCE_BINS = (
     ("none", -1, -1),
     ("1_16", 1, 16),
@@ -1774,105 +1621,6 @@ class XSALossSliceRecorder:
         return data
 
 
-@dataclass(slots=True)
-class XSAInterventionConfig:
-    name: str
-    kind: str
-    strength: float = 0.0
-    diag_mass: float = 0.0
-    layers: tuple[int, ...] | None = None
-    token_filter: str = "all"
-    apply_learned_xsa_after: bool = False
-
-
-xsa_intervention_config: XSAInterventionConfig | None = None
-
-
-def _parse_xsa_intervention_layers(spec: str) -> tuple[int, ...] | None:
-    spec = spec.strip().lower()
-    if spec in ("all", "*"):
-        return None
-    layers = tuple(int(part) for part in spec.replace(",", " ").split() if part)
-    if not layers:
-        raise ValueError(f"Empty XSA intervention layer spec {spec!r}")
-    return layers
-
-
-def _xsa_intervention_layer_label(layers: tuple[int, ...] | None) -> str:
-    if layers is None:
-        return "all"
-    return "-".join(str(layer) for layer in layers)
-
-
-def _xsa_float_label(value: float) -> str:
-    return f"{value:g}".replace("-", "m").replace(".", "p")
-
-
-def build_xsa_intervention_suite():
-    conditions: list[XSAInterventionConfig | None] = [None]
-    conditions.append(XSAInterventionConfig(name="no_xsa_all", kind="no-xsa", layers=None))
-    token_filters = args.xsa_intervention_token_filters
-    layer_specs = args.xsa_intervention_layers
-    layer_items = [(spec, _parse_xsa_intervention_layers(spec)) for spec in layer_specs]
-    for layer_spec, layers in layer_items:
-        layer_label = _xsa_intervention_layer_label(layers)
-        for token_filter in token_filters:
-            filter_suffix = "" if token_filter == "all" else f"_{token_filter.replace('-', '_')}"
-            for diag_mass in args.xsa_intervention_diag_masses:
-                conditions.append(XSAInterventionConfig(
-                    name=f"force_diag_c{_xsa_float_label(diag_mass)}_L{layer_label}{filter_suffix}",
-                    kind="force-diag",
-                    diag_mass=diag_mass,
-                    layers=layers,
-                    token_filter=token_filter,
-                    apply_learned_xsa_after=True,
-                ))
-            for strength in args.xsa_intervention_strengths:
-                strength_label = _xsa_float_label(strength)
-                conditions.extend([
-                    XSAInterventionConfig(
-                        name=f"diag_remove_g{strength_label}_L{layer_label}{filter_suffix}",
-                        kind="diag-remove",
-                        strength=strength,
-                        layers=layers,
-                        token_filter=token_filter,
-                    ),
-                    XSAInterventionConfig(
-                        name=f"context_remove_g{strength_label}_L{layer_label}{filter_suffix}",
-                        kind="context-remove",
-                        strength=strength,
-                        layers=layers,
-                        token_filter=token_filter,
-                    ),
-                    XSAInterventionConfig(
-                        name=f"diag_addback_e{strength_label}_L{layer_label}{filter_suffix}",
-                        kind="diag-addback",
-                        strength=strength,
-                        layers=layers,
-                        token_filter=token_filter,
-                    ),
-                    XSAInterventionConfig(
-                        name=f"context_addback_e{strength_label}_L{layer_label}{filter_suffix}",
-                        kind="context-addback",
-                        strength=strength,
-                        layers=layers,
-                        token_filter=token_filter,
-                    ),
-                ])
-            conditions.append(XSAInterventionConfig(
-                name=f"shuffle_proj_g1_L{layer_label}{filter_suffix}",
-                kind="shuffle-proj",
-                strength=1.0,
-                layers=layers,
-                token_filter=token_filter,
-            ))
-    return conditions
-
-
-def xsa_intervention_condition_names(conditions: list[XSAInterventionConfig | None]):
-    return tuple("baseline_record" if condition is None else condition.name for condition in conditions)
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
@@ -1883,130 +1631,6 @@ class CausalSelfAttention(nn.Module):
         self.paired = paired
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
-
-    def _intervention_applies(self, layer_idx: int):
-        condition = xsa_intervention_config
-        if condition is None or self.paired:
-            return None
-        if condition.layers is not None and layer_idx not in condition.layers:
-            return None
-        return condition
-
-    def _apply_record_xsa(self, y: Tensor, v: Tensor, xsa_alpha: Tensor | None):
-        if xsa_alpha is None:
-            return y
-        if self.paired:
-            B, T = y.size(0), y.size(1)
-            y_xsa = y.view(B, T, 2, self.num_heads // 2, self.head_dim)
-            v_xsa = v.view(B, T, 2, self.num_heads // 2, self.head_dim)
-            alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, 2, self.num_heads // 2, 1)
-        else:
-            y_xsa = y
-            v_xsa = v
-            alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
-        vn = F.normalize(v_xsa, dim=-1, eps=1e-4)
-        proj = (y_xsa * vn).sum(-1, keepdim=True)
-        projection = proj * vn
-        if args.xsa_detach_projection:
-            projection = projection.detach()
-        return (y_xsa - alpha * projection).view_as(y)
-
-    def _apply_record_xsa_segment(self, y: Tensor, v: Tensor, xsa_alpha: Tensor | None):
-        if xsa_alpha is None:
-            return y
-        vn = F.normalize(v, dim=-1, eps=1e-4)
-        proj = (y * vn).sum(-1, keepdim=True)
-        alpha = torch.tanh(xsa_alpha).type_as(y).view(self.num_heads, 1, 1)
-        return y - alpha * proj * vn
-
-    def _intervention_token_mask(self, condition: XSAInterventionConfig, diag: Tensor,
-                                 context_proj: Tensor, y_seg: Tensor, v_seg: Tensor):
-        if condition.token_filter == "all":
-            return None
-        y_norm_sq = y_seg.square().sum(dim=-1).clamp_min(1e-12)
-        v_norm_sq = v_seg.square().sum(dim=-1).clamp_min(1e-12)
-        if condition.token_filter == "high-self":
-            score = diag
-        elif condition.token_filter == "high-context":
-            score = (context_proj * context_proj).sum(dim=-1) / y_norm_sq
-        elif condition.token_filter == "high-aligned":
-            dot_y_v = (y_seg * v_seg).sum(dim=-1)
-            score = dot_y_v.square() / (y_norm_sq * v_norm_sq)
-        else:
-            raise ValueError(f"Unsupported XSA intervention token filter {condition.token_filter!r}")
-        threshold = torch.quantile(score.flatten().float(), args.xsa_intervention_quantile)
-        return score >= threshold
-
-    def _explicit_attention_intervention(self, q: Tensor, k: Tensor, v: Tensor, seqlens: Tensor,
-                                         bm_size: int, attn_scale: float,
-                                         condition: XSAInterventionConfig, xsa_alpha: Tensor | None):
-        output_dtype = v.dtype
-        q = q[0].float()
-        k = k[0].float()
-        v = v[0].float()
-        y_out = torch.empty_like(v)
-        boundaries = [int(x) for x in seqlens.detach().cpu().tolist()]
-        boundaries = [x for x in boundaries if 0 <= x <= q.size(0)]
-        if not boundaries or boundaries[0] != 0:
-            boundaries = [0, *boundaries]
-        if boundaries[-1] != q.size(0):
-            boundaries.append(q.size(0))
-
-        for start, end in pairwise(boundaries):
-            if end <= start:
-                continue
-            q_seg = q[start:end].transpose(0, 1)
-            k_seg = k[start:end].transpose(0, 1)
-            v_seg = v[start:end].transpose(0, 1)
-            length = end - start
-            scores = torch.matmul(q_seg, k_seg.transpose(-1, -2)) * attn_scale
-            row = torch.arange(length, device=device).view(length, 1)
-            col = torch.arange(length, device=device).view(1, length)
-            mask = col <= row
-            if bm_size is not None:
-                mask = mask & (col >= row - int(bm_size))
-            scores = scores.masked_fill(~mask.view(1, length, length), -torch.inf)
-            attn = torch.softmax(scores, dim=-1)
-            y_seg = torch.matmul(attn, v_seg)
-            diag_idx = torch.arange(length, device=device)
-            diag = attn.diagonal(dim1=-2, dim2=-1)
-            diag_value = diag.unsqueeze(-1) * v_seg
-            attn_context = attn.clone()
-            attn_context[:, diag_idx, diag_idx] = 0.0
-            context_value = torch.matmul(attn_context, v_seg)
-            v_norm_sq = v_seg.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            context_proj = ((context_value * v_seg).sum(dim=-1, keepdim=True) / v_norm_sq) * v_seg
-
-            if condition.kind == "force-diag":
-                context_den = attn_context.sum(dim=-1, keepdim=True)
-                attn_context_norm = attn_context / context_den.clamp_min(1e-12)
-                attn_context_norm = torch.where(context_den > 0, attn_context_norm, torch.zeros_like(attn_context_norm))
-                y_mod = (1.0 - condition.diag_mass) * torch.matmul(attn_context_norm, v_seg) + condition.diag_mass * v_seg
-            elif condition.kind == "diag-remove":
-                y_mod = y_seg - condition.strength * diag_value
-            elif condition.kind == "context-remove":
-                y_mod = y_seg - condition.strength * context_proj
-            elif condition.kind == "diag-addback":
-                y_mod = self._apply_record_xsa_segment(y_seg, v_seg, xsa_alpha)
-                y_mod = y_mod + condition.strength * diag_value
-            elif condition.kind == "context-addback":
-                y_mod = self._apply_record_xsa_segment(y_seg, v_seg, xsa_alpha)
-                y_mod = y_mod + condition.strength * context_proj
-            elif condition.kind == "shuffle-proj":
-                shuffled_v = torch.roll(v_seg, shifts=args.xsa_intervention_shuffle_shift, dims=1)
-                if length > 1:
-                    shuffled_v[:, :args.xsa_intervention_shuffle_shift] = v_seg[:, :args.xsa_intervention_shuffle_shift]
-                shuffled_norm_sq = shuffled_v.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                shuffled_proj = ((y_seg * shuffled_v).sum(dim=-1, keepdim=True) / shuffled_norm_sq) * shuffled_v
-                y_mod = y_seg - condition.strength * shuffled_proj
-            else:
-                raise ValueError(f"Unsupported XSA intervention kind {condition.kind!r}")
-
-            token_mask = self._intervention_token_mask(condition, diag, context_proj, y_seg, v_seg)
-            if token_mask is not None:
-                y_mod = torch.where(token_mask.unsqueeze(-1), y_mod, y_seg)
-            y_out[start:end] = y_mod.transpose(0, 1).to(y_out.dtype)
-        return y_out.unsqueeze(0).to(dtype=output_dtype)
 
     def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -2053,24 +1677,8 @@ class CausalSelfAttention(nn.Module):
             seqlens = 2 * seqlens
             max_len = 2 * max_len
 
-        substoch_mode = args.xsa_mode in {"substoch", "substoch-delta"} and not self.paired
-        intervention = self._intervention_applies(attn_args.layer_idx)
-        explicit_intervention_kinds = {
-            "force-diag",
-            "diag-remove",
-            "context-remove",
-            "diag-addback",
-            "context-addback",
-            "shuffle-proj",
-        }
-        intervention_handles_xsa = intervention is not None and intervention.kind in {
-            "no-xsa",
-            "diag-remove",
-            "context-remove",
-            "diag-addback",
-            "context-addback",
-            "shuffle-proj",
-        }
+        substoch_mode = args.xsa_mode in {"substoch", "substoch-delta", "substock", "substock-delta"} and not self.paired
+        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
         if substoch_mode:
             y, softmax_lse = flash_attn_interface.flash_attn_varlen_func(
                 q[0], k[0], v[0],
@@ -2083,27 +1691,14 @@ class CausalSelfAttention(nn.Module):
                 window_size=(bm_size, 0),
                 return_attn_probs=True,
             )
-            y = y.view(B, T, self.num_heads, self.head_dim)
-        elif intervention is not None and intervention.kind in explicit_intervention_kinds:
-            y = self._explicit_attention_intervention(
-                q,
-                k,
-                v,
-                seqlens,
-                bm_size,
-                yarn.attn_scale,
-                intervention,
-                attn_args.xsa_alpha,
-            )
         else:
-            # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
             y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                             max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                             causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
-            y = y.view(B, T, self.num_heads, self.head_dim)
+        y = y.view(B, T, self.num_heads, self.head_dim)
         y_raw = y
-        # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(alpha)
-        # of y aligned with vhat.
+        # Gated XSA (arXiv:2603.09078) with learnable strength: subtract per-head fraction tanh(α)
+        # of y aligned with v̂. Non-paired only (v shape doesn't line up for paired layers).
         if substoch_mode:
             lengths = (seqlens[1:] - seqlens[:-1]).clamp_min(0).long()
             starts = seqlens[:-1].long()
@@ -2118,16 +1713,19 @@ class CausalSelfAttention(nn.Module):
             gate_logit = F.linear(x[..., :12].float(), attn_gate_w.float()).view(B, T, self.num_heads)
             lse = softmax_lse.transpose(0, 1).view(B, T, self.num_heads)
             attn_gate = torch.sigmoid(lse - n_visible.float().log().view(B, T, 1) + gate_logit).unsqueeze(-1).to(y.dtype)
-            y = attn_gate * (y - v if args.xsa_mode == "substoch-delta" else y)
-        elif args.xsa_mode == "record" and attn_args.xsa_alpha is not None and not intervention_handles_xsa:
-            y = self._apply_record_xsa(y, v, attn_args.xsa_alpha)
-        elif args.xsa_mode == "value" and not self.paired and not intervention_handles_xsa:
+            y = attn_gate * (y - v if args.xsa_mode in {"substoch-delta", "substock-delta"} else y)
+        elif args.xsa_mode == "record" and attn_args.xsa_alpha is not None and not self.paired:
+            vn = F.normalize(v, dim=-1, eps=1e-4)
+            proj = (y * vn).sum(-1, keepdim=True)
+            alpha = torch.tanh(attn_args.xsa_alpha).type_as(y).view(1, 1, self.num_heads, 1)
+            y = y - alpha * proj * vn
+        elif args.xsa_mode == "value" and not self.paired:
             y_f = y.float()
             v_f = v.float()
             numer = (y_f * v_f).sum(dim=-1, keepdim=True)
             denom = v_f.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
             y = (y_f - args.model_xsa_lambda * (numer / denom) * v_f).to(y.dtype)
-        elif args.xsa_mode == "output-metric-diag" and attn_args.xsa_alpha is not None and not self.paired and not intervention_handles_xsa:
+        elif args.xsa_mode == "output-metric-diag" and attn_args.xsa_alpha is not None and not self.paired:
             if args.output_metric_detach and args.output_metric_bf16_projection:
                 with torch.no_grad():
                     metric_diag = qkvo_w[self.dim * 3:].float().square().sum(dim=0)
@@ -2149,11 +1747,16 @@ class CausalSelfAttention(nn.Module):
                 denom = (v_f * weighted_v).sum(dim=-1, keepdim=True).clamp_min(1e-12)
                 alpha = torch.tanh(attn_args.xsa_alpha).float().view(1, 1, self.num_heads, 1)
                 y = (y_f - alpha * (numer / denom) * v_f).to(y.dtype)
+        elif args.xsa_mode == "laplacian" and not self.paired:
+            y = y - v
+        elif args.xsa_mode == "laplacian-gated" and attn_args.xsa_alpha is not None and not self.paired:
+            alpha = (1.0 + torch.tanh(attn_args.xsa_alpha)).type_as(y).view(1, 1, self.num_heads, 1)
+            y = y - alpha * v
         y_post_head_xsa = y
         if substoch_mode:
             y_gated = y
         elif args.disable_attn_gate:
-            attn_gate = torch.ones((B, T, self.num_heads, 1), device=x.device, dtype=y.dtype)
+            attn_gate = torch.ones(B, T, self.num_heads, 1, device=y.device, dtype=y.dtype)
             y_gated = y
         else:
             attn_gate = torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
@@ -2184,17 +1787,6 @@ class CausalSelfAttention(nn.Module):
                 y_raw,
                 y_gated,
                 attn_gate,
-                seqlens,
-                bm_size,
-                yarn.attn_scale,
-            )
-        if xsa_beta_diag_recorder is not None and not self.paired:
-            xsa_beta_diag_recorder.record(
-                attn_args.layer_idx,
-                q,
-                k,
-                v,
-                y_raw,
                 seqlens,
                 bm_size,
                 yarn.attn_scale,
@@ -2421,9 +2013,8 @@ class GPT(nn.Module):
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
         # Learnable XSA strengths are available to modes that use upstream's per-head tanh(alpha) weighting.
         xsa_alpha_per_layer = self.xsa_alphas.unbind(0)
-        if args.xsa_mode in {"record", "output-metric-diag"}:
-            xsa_layers = {1, 3, 4, 7, 8, 10}.difference(args.xsa_disable_layers)
-            xsa_alphas = [xsa_alpha_per_layer[j] if j in xsa_layers else None for j in range(self.num_layers)]
+        if args.xsa_mode in {"record", "output-metric-diag", "laplacian-gated"}:
+            xsa_alphas = [xsa_alpha_per_layer[j] if j in {1, 3, 4, 7, 8, 10} else None for j in range(self.num_layers)]
         else:
             xsa_alphas = [None] * self.num_layers
         assert len(attn_gates) == self.num_layers
@@ -2517,9 +2108,9 @@ class GPT(nn.Module):
                     x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
 
             if mu is not None:
-                x = mu[12] * x + mu[13] * relu_squared_mlp(norm(x), c_fc, c_proj)
+                x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * relu_squared_mlp(norm(x), c_fc, c_proj)
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -2723,17 +2314,6 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
             num_tokens = new_num_tokens // new_grad_accum_steps
             max_seq_len = new_max_seq_len
 
-
-def next_data_batch(loader, send_args, started: bool):
-    if not started:
-        batch = next(loader)
-        started = True
-        if send_args is not None:
-            batch = loader.send(send_args)
-        return batch, started
-    return loader.send(send_args), started
-
-
 # -----------------------------------------------------------------------------
 # Training Management
 
@@ -2763,21 +2343,15 @@ class Hyperparameters:
     checkpoint_dir: str = os.environ.get("CHECKPOINT_DIR", os.path.join(log_dir, "checkpoints"))
     load_checkpoint: str | None = os.environ.get("LOAD_CHECKPOINT")
     load_optimizer: bool = os.environ.get("LOAD_OPTIMIZER", "0").lower() in ("1", "true", "yes")
-    train_steps_override: int | None = int(os.environ["TRAIN_STEPS"]) if "TRAIN_STEPS" in os.environ else None
     max_train_steps: int | None = int(os.environ["MAX_TRAIN_STEPS"]) if "MAX_TRAIN_STEPS" in os.environ else None
     skip_warmup: bool = os.environ.get("SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
     skip_validation: bool = os.environ.get("SKIP_VALIDATION", "0").lower() in ("1", "true", "yes")
     xsa_mode: str = os.environ.get("XSA_MODE", "record").replace("_", "-")
-    xsa_detach_projection: bool = os.environ.get("XSA_DETACH_PROJECTION", "0").lower() in ("1", "true", "yes")
     model_xsa_lambda: float = float(os.environ.get("MODEL_XSA_LAMBDA", "1.0"))
     output_metric_detach: bool = os.environ.get("OUTPUT_METRIC_DETACH", "0").lower() in ("1", "true", "yes")
     output_metric_bf16_projection: bool = os.environ.get("OUTPUT_METRIC_BF16_PROJECTION", "0").lower() in ("1", "true", "yes")
     disable_attn_gate: bool = os.environ.get("DISABLE_ATTN_GATE", "0").lower() in ("1", "true", "yes")
-    xsa_disable_layers: tuple[int, ...] = tuple(
-        int(s) for s in os.environ.get("XSA_DISABLE_LAYERS", "").replace(",", " ").split()
-    )
     xsa_interp: bool = os.environ.get("XSA_INTERP", "0").lower() in ("1", "true", "yes")
-    post_train_xsa_interp: bool = os.environ.get("POST_TRAIN_XSA_INTERP", "0").lower() in ("1", "true", "yes")
     xsa_interp_tests: tuple[str, ...] = tuple(s for s in os.environ.get("XSA_INTERP_TESTS", "alignment").replace(",", " ").split())
     xsa_interp_modes: tuple[str, ...] = tuple(s.replace("_", "-") for s in os.environ.get(
         "XSA_INTERP_MODES",
@@ -2790,20 +2364,6 @@ class Hyperparameters:
     xsa_interp_final_ws: bool = os.environ.get("XSA_INTERP_FINAL_WS", "1").lower() in ("1", "true", "yes")
     val_every_after_step: int | None = int(os.environ["VAL_EVERY_AFTER_STEP"]) if "VAL_EVERY_AFTER_STEP" in os.environ else None
     stop_val_loss_below: float | None = float(os.environ["STOP_VAL_LOSS_BELOW"]) if "STOP_VAL_LOSS_BELOW" in os.environ else None
-    xsa_intervention_layers: tuple[str, ...] = tuple(
-        s for s in os.environ.get("XSA_INTERVENTION_LAYERS", "all 3 4 7 8").replace(",", " ").split()
-    )
-    xsa_intervention_strengths: tuple[float, ...] = tuple(
-        float(s) for s in os.environ.get("XSA_INTERVENTION_STRENGTHS", "0.5 1.0").replace(",", " ").split()
-    )
-    xsa_intervention_diag_masses: tuple[float, ...] = tuple(
-        float(s) for s in os.environ.get("XSA_INTERVENTION_DIAG_MASSES", "0 0.2 0.4").replace(",", " ").split()
-    )
-    xsa_intervention_token_filters: tuple[str, ...] = tuple(
-        s.replace("_", "-") for s in os.environ.get("XSA_INTERVENTION_TOKEN_FILTERS", "all").replace(",", " ").split()
-    )
-    xsa_intervention_quantile: float = float(os.environ.get("XSA_INTERVENTION_QUANTILE", "0.9"))
-    xsa_intervention_shuffle_shift: int = int(os.environ.get("XSA_INTERVENTION_SHUFFLE_SHIFT", "1"))
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -2817,7 +2377,6 @@ def apply_cli_overrides(args: Hyperparameters):
 
     parser = argparse.ArgumentParser(description="Train modded-nanogpt")
     parser.add_argument("--max-train-steps", type=int, default=None, help="Cap optimizer steps; 1 runs one training step then exits.")
-    parser.add_argument("--train-steps", type=int, default=None, help="Override total optimizer steps, extending at final schedule settings if needed.")
     parser.add_argument("--num-scheduled-iterations", type=int, default=None,
                         help="Number of steps to complete LR/window schedule before extension.")
     parser.add_argument("--num-extension-iterations", type=int, default=None,
@@ -2833,12 +2392,8 @@ def apply_cli_overrides(args: Hyperparameters):
     parser.add_argument("--load-optimizer", action="store_true",
                         help="Also load optimizer state from --load-checkpoint for training resumes.")
     parser.add_argument("--run-evals", action="store_true", help="Run extra evals after training.")
-    parser.add_argument("--xsa-mode", choices=("record", "none", "value", "output-metric-diag", "substoch", "substoch-delta"), default=None,
-                        help="Attention projection mode: upstream learnable XSA, no XSA, value-space XSA, diagonal output-metric XSA, or sub-stochastic attention.")
-    parser.add_argument("--xsa-detach-projection", dest="xsa_detach_projection", action="store_true", default=None,
-                        help="Detach the record-mode XSA projection vector before subtracting it.")
-    parser.add_argument("--no-xsa-detach-projection", dest="xsa_detach_projection", action="store_false",
-                        help="Backpropagate through the record-mode XSA projection vector.")
+    parser.add_argument("--xsa-mode", choices=("record", "none", "value", "output-metric-diag", "laplacian", "laplacian-gated", "substoch", "substoch-delta", "substock", "substock-delta"), default=None,
+                        help="Attention projection mode: upstream learnable XSA, no XSA, value-space XSA, diagonal output-metric XSA, Laplacian attention, or sub-stochastic attention.")
     parser.add_argument("--model-xsa-lambda", type=float, default=None, help="Projection strength for value/output-metric-diag XSA modes.")
     parser.add_argument("--output-metric-detach", dest="output_metric_detach", action="store_true", default=None,
                         help="Treat output-metric diagonals as fixed in output-metric-diag backward.")
@@ -2849,15 +2404,11 @@ def apply_cli_overrides(args: Hyperparameters):
     parser.add_argument("--no-output-metric-bf16-projection", dest="output_metric_bf16_projection", action="store_false",
                         help="Use fp32 arithmetic for output-metric-diag token projections.")
     parser.add_argument("--disable-attn-gate", dest="disable_attn_gate", action="store_true", default=None,
-                        help="Ablation: replace sparse attention gate activations with ones.")
+                        help="Bypass the learned sparse attention output gate.")
     parser.add_argument("--enable-attn-gate", dest="disable_attn_gate", action="store_false",
-                        help="Use the learned sparse attention gate activations.")
-    parser.add_argument("--xsa-disable-layers", default=None,
-                        help="Comma- or space-separated zero-indexed layer ids where learned XSA should be disabled.")
+                        help="Use the learned sparse attention output gate.")
     parser.add_argument("--xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
                         help="Run XSA geometry interpretation on validation batches, save metrics, plot, and exit.")
-    parser.add_argument("--post-train-xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
-                        help="Run XSA interpretation after the training loop finishes, without requiring a checkpoint reload.")
     parser.add_argument("--xsa-interp-tests", default=None,
                         help="Comma- or space-separated interp tests to run. Supported: alignment, loss-slices, attention-diagnostics.")
     parser.add_argument("--xsa-interp-modes", default=None,
@@ -2876,24 +2427,10 @@ def apply_cli_overrides(args: Hyperparameters):
                         help="Run validation at every step starting from this step, in addition to the normal cadence.")
     parser.add_argument("--stop-val-loss-below", type=float, default=None,
                         help="Stop training after a validation whose loss is below this threshold.")
-    parser.add_argument("--xsa-intervention-layers", default=None,
-                        help="Layer specs for causal interventions, e.g. 'all 3 4 7 8'.")
-    parser.add_argument("--xsa-intervention-strengths", default=None,
-                        help="Strengths for remove/addback interventions, e.g. '0.5 1.0'.")
-    parser.add_argument("--xsa-intervention-diag-masses", default=None,
-                        help="Forced diagonal masses for force-diag interventions, e.g. '0 0.2 0.4'.")
-    parser.add_argument("--xsa-intervention-token-filters", default=None,
-                        help="Token filters for interventions. Supported: all, high-self, high-context, high-aligned.")
-    parser.add_argument("--xsa-intervention-quantile", type=float, default=None,
-                        help="Quantile threshold for high-* token filters.")
-    parser.add_argument("--xsa-intervention-shuffle-shift", type=int, default=None,
-                        help="Within-sequence value shift for shuffled projection controls.")
     cli_args, _ = parser.parse_known_args()
 
     if cli_args.max_train_steps is not None:
         args.max_train_steps = cli_args.max_train_steps
-    if cli_args.train_steps is not None:
-        args.train_steps_override = cli_args.train_steps
     if cli_args.num_scheduled_iterations is not None:
         args.num_scheduled_iterations = cli_args.num_scheduled_iterations
     if cli_args.num_extension_iterations is not None:
@@ -2918,8 +2455,6 @@ def apply_cli_overrides(args: Hyperparameters):
         args.run_evals = True
     if cli_args.xsa_mode is not None:
         args.xsa_mode = cli_args.xsa_mode
-    if cli_args.xsa_detach_projection is not None:
-        args.xsa_detach_projection = cli_args.xsa_detach_projection
     if cli_args.model_xsa_lambda is not None:
         args.model_xsa_lambda = cli_args.model_xsa_lambda
     if cli_args.output_metric_detach is not None:
@@ -2928,12 +2463,8 @@ def apply_cli_overrides(args: Hyperparameters):
         args.output_metric_bf16_projection = cli_args.output_metric_bf16_projection
     if cli_args.disable_attn_gate is not None:
         args.disable_attn_gate = cli_args.disable_attn_gate
-    if cli_args.xsa_disable_layers is not None:
-        args.xsa_disable_layers = tuple(int(s) for s in cli_args.xsa_disable_layers.replace(",", " ").split())
     if cli_args.xsa_interp is not None:
         args.xsa_interp = cli_args.xsa_interp
-    if cli_args.post_train_xsa_interp is not None:
-        args.post_train_xsa_interp = cli_args.post_train_xsa_interp
     if cli_args.xsa_interp_tests is not None:
         args.xsa_interp_tests = tuple(s for s in cli_args.xsa_interp_tests.replace(",", " ").split())
     if cli_args.xsa_interp_modes is not None:
@@ -2952,56 +2483,24 @@ def apply_cli_overrides(args: Hyperparameters):
         args.val_every_after_step = cli_args.val_every_after_step
     if cli_args.stop_val_loss_below is not None:
         args.stop_val_loss_below = cli_args.stop_val_loss_below
-    if cli_args.xsa_intervention_layers is not None:
-        args.xsa_intervention_layers = tuple(s for s in cli_args.xsa_intervention_layers.replace(",", " ").split())
-    if cli_args.xsa_intervention_strengths is not None:
-        args.xsa_intervention_strengths = tuple(float(s) for s in cli_args.xsa_intervention_strengths.replace(",", " ").split())
-    if cli_args.xsa_intervention_diag_masses is not None:
-        args.xsa_intervention_diag_masses = tuple(float(s) for s in cli_args.xsa_intervention_diag_masses.replace(",", " ").split())
-    if cli_args.xsa_intervention_token_filters is not None:
-        args.xsa_intervention_token_filters = tuple(s.replace("_", "-") for s in cli_args.xsa_intervention_token_filters.replace(",", " ").split())
-    if cli_args.xsa_intervention_quantile is not None:
-        args.xsa_intervention_quantile = cli_args.xsa_intervention_quantile
-    if cli_args.xsa_intervention_shuffle_shift is not None:
-        args.xsa_intervention_shuffle_shift = cli_args.xsa_intervention_shuffle_shift
 
-    supported_xsa_modes = ("record", "none", "value", "output-metric-diag", "substoch", "substoch-delta")
+    supported_xsa_modes = ("record", "none", "value", "output-metric-diag", "laplacian", "laplacian-gated", "substoch", "substoch-delta", "substock", "substock-delta")
     if args.xsa_mode not in supported_xsa_modes:
         raise ValueError(f"Unsupported XSA_MODE={args.xsa_mode!r}")
     unsupported_interp_modes = tuple(mode for mode in args.xsa_interp_modes if mode not in supported_xsa_modes)
     if unsupported_interp_modes:
         raise ValueError(f"Unsupported XSA_INTERP_MODES entries: {unsupported_interp_modes}")
-    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices", "attention-diagnostics", "causal-interventions", "beta-diagnostics"))
+    unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices", "attention-diagnostics"))
     if unsupported_interp_tests:
         raise ValueError(f"Unsupported XSA_INTERP_TESTS entries: {unsupported_interp_tests}")
     if args.xsa_interp and not args.xsa_interp_tests:
         raise ValueError("XSA_INTERP_TESTS must include at least one test when XSA_INTERP is enabled")
     if args.xsa_interp and any(test in args.xsa_interp_tests for test in ("alignment", "loss-slices", "attention-diagnostics")) and not args.xsa_interp_modes:
         raise ValueError("XSA_INTERP_MODES must include at least one mode when alignment, loss-slices, or attention-diagnostics interp is enabled")
-    unsupported_token_filters = tuple(
-        token_filter for token_filter in args.xsa_intervention_token_filters
-        if token_filter not in ("all", "high-self", "high-context", "high-aligned")
-    )
-    if unsupported_token_filters:
-        raise ValueError(f"Unsupported XSA intervention token filters: {unsupported_token_filters}")
-    if not args.xsa_intervention_layers:
-        raise ValueError("XSA_INTERVENTION_LAYERS must include at least one layer spec")
-    if not args.xsa_intervention_strengths:
-        raise ValueError("XSA_INTERVENTION_STRENGTHS must include at least one value")
-    if not args.xsa_intervention_diag_masses:
-        raise ValueError("XSA_INTERVENTION_DIAG_MASSES must include at least one value")
-    if not (0.0 < args.xsa_intervention_quantile < 1.0):
-        raise ValueError("XSA_INTERVENTION_QUANTILE must be between 0 and 1")
-    if args.xsa_intervention_shuffle_shift <= 0:
-        raise ValueError("XSA_INTERVENTION_SHUFFLE_SHIFT must be positive")
     if not math.isfinite(args.model_xsa_lambda):
         raise ValueError(f"MODEL_XSA_LAMBDA must be finite, got {args.model_xsa_lambda}")
-    if any(layer < 0 or layer >= 11 for layer in args.xsa_disable_layers):
-        raise ValueError(f"XSA_DISABLE_LAYERS entries must be in [0, 10], got {args.xsa_disable_layers}")
     if any(step < 0 for step in args.extra_val_steps):
         raise ValueError(f"EXTRA_VAL_STEPS must be nonnegative, got {args.extra_val_steps}")
-    if args.train_steps_override is not None and args.train_steps_override < 0:
-        raise ValueError(f"TRAIN_STEPS must be nonnegative, got {args.train_steps_override}")
     if args.xsa_interp_step is not None and args.xsa_interp_step < 0:
         raise ValueError(f"XSA_INTERP_STEP must be nonnegative, got {args.xsa_interp_step}")
     if args.val_every_after_step is not None and args.val_every_after_step < 0:
@@ -3111,7 +2610,7 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
         frac = step / muon_warmup_steps
         momentum = momentum_min + frac * (momentum_max - momentum_min)
     elif step > momentum_cd_start:
-        frac = min(1.0, (step - momentum_cd_start) / muon_cooldown_steps)
+        frac = (step - momentum_cd_start) / muon_cooldown_steps
         momentum = momentum_max - frac * (momentum_max - momentum_min)
     else:
         momentum = momentum_max
@@ -3236,7 +2735,7 @@ class TrainingManager():
             self.train_loader_send_args = None
 
         self.ws_long = new_ws_long
-        self.mtp_weights = training_schedule.mtp_weights[min(step, len(training_schedule.mtp_weights) - 1)]
+        self.mtp_weights = training_schedule.mtp_weights[step]
 
     def step_optimizers(self, step: int):
         step_lr = training_schedule.get_lr(step)
@@ -3353,7 +2852,6 @@ print0(f"Log dir: {args.log_dir}")
 print0(f"Checkpoint dir: {args.checkpoint_dir}")
 print0(f"Load checkpoint: {args.load_checkpoint}")
 print0(f"Load optimizer: {args.load_optimizer}")
-print0(f"Train steps override: {args.train_steps_override}")
 print0(f"Num scheduled iterations: {args.num_scheduled_iterations}")
 print0(f"Num extension iterations: {args.num_extension_iterations}")
 print0(f"Max train steps: {args.max_train_steps}")
@@ -3361,14 +2859,11 @@ print0(f"Skip warmup: {args.skip_warmup}")
 print0(f"Skip validation: {args.skip_validation}")
 print0(f"Extra val steps: {args.extra_val_steps}")
 print0(f"XSA mode: {args.xsa_mode}")
-print0(f"XSA detach projection: {args.xsa_detach_projection}")
 print0(f"Model XSA lambda: {args.model_xsa_lambda}")
 print0(f"Output metric detach: {args.output_metric_detach}")
 print0(f"Output metric bf16 projection: {args.output_metric_bf16_projection}")
 print0(f"Disable attention gate: {args.disable_attn_gate}")
-print0(f"XSA disable layers: {args.xsa_disable_layers}")
 print0(f"XSA interp: {args.xsa_interp}")
-print0(f"Post-train XSA interp: {args.post_train_xsa_interp}")
 print0(f"XSA interp tests: {args.xsa_interp_tests}")
 print0(f"XSA interp modes: {args.xsa_interp_modes}")
 print0(f"XSA interp batches: {args.xsa_interp_batches}")
@@ -3464,14 +2959,10 @@ if loaded_checkpoint is not None:
     del loaded_checkpoint
     gc.collect()
 
-completed_train_step: int | None = None
-
 
 def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn):
-    global xsa_interp_active
-    global xsa_interp_recorder, xsa_attention_diag_recorder, xsa_beta_diag_recorder, xsa_intervention_config
+    global xsa_interp_recorder, xsa_attention_diag_recorder
     original_xsa_mode = args.xsa_mode
-    xsa_interp_active = True
     print_fn(
         f"Running XSA interp tests {args.xsa_interp_tests} for {args.xsa_interp_batches} validation batch(es) "
         f"of {args.xsa_interp_batch_size} total tokens",
@@ -3479,11 +2970,7 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
     )
     interp_step = args.xsa_interp_step
     if interp_step is None:
-        interp_step = (
-            loaded_checkpoint_step if loaded_checkpoint_step is not None
-            else completed_train_step if completed_train_step is not None
-            else 0
-        )
+        interp_step = loaded_checkpoint_step if loaded_checkpoint_step is not None else 0
     schedule_step = min(interp_step, len(training_schedule.mtp_weights) - 1)
     if schedule_step != interp_step:
         print_fn(
@@ -3524,7 +3011,6 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
                 data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
@@ -3590,7 +3076,6 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
                 data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
@@ -3626,7 +3111,6 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
                 data["xsa_interp_schedule_step"] = np.array(schedule_step)
                 data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
                 data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
@@ -3646,129 +3130,10 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                 npz_path, svg_path = save_xsa_attention_diag_sweep_outputs(attention_results, args.xsa_interp_dir, args.run_id)
                 print_fn(f"Saved XSA attention diagnostics sweep metrics: {npz_path}", console=True)
                 print_fn(f"Saved XSA attention diagnostics sweep plot: {svg_path}", console=True)
-
-        if "beta-diagnostics" in args.xsa_interp_tests:
-            print_fn("Running XSA beta diagnostics with xsa_mode=record", console=True)
-            args.xsa_mode = "record"
-            token_class_masks = _build_token_class_masks(model.vocab_size)
-            beta_recorder = None
-            val_loader = distributed_data_generator(
-                args.val_files,
-                args.xsa_interp_batch_size,
-                -1,
-                grad_accum_steps=grad_accum_steps,
-                align_to_bos=False,
-            )
-            with torch.no_grad():
-                for _ in range(args.xsa_interp_batches):
-                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                    bucket_masks = _loss_slice_bucket_masks(
-                        inputs.detach().cpu().numpy(),
-                        targets.detach().cpu().numpy(),
-                        cum_seqlens.detach().cpu().numpy(),
-                        model.vocab_size,
-                        token_class_masks,
-                    )
-                    if beta_recorder is None:
-                        beta_recorder = XSABetaDiagRecorder(
-                            num_layers=11,
-                            num_heads=6,
-                            bucket_names=[name for name, _ in bucket_masks],
-                        )
-                    xsa_beta_diag_recorder = beta_recorder
-                    beta_recorder.set_bucket_masks(bucket_masks)
-                    model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-            del val_loader
-            xsa_beta_diag_recorder = None
-            if beta_recorder is not None:
-                beta_recorder.sync_distributed()
-                data = beta_recorder.as_numpy()
-                data["interp_test"] = np.array("beta-diagnostics")
-                data["xsa_mode"] = np.array("record")
-                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
-                data["xsa_interp_schedule_step"] = np.array(schedule_step)
-                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
-                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
-                if master_process:
-                    from xsa_interp import save_xsa_beta_diag_outputs
-
-                    npz_path, svg_path = save_xsa_beta_diag_outputs(data, args.xsa_interp_dir, args.run_id)
-                    print_fn(f"Saved XSA beta diagnostics metrics: {npz_path}", console=True)
-                    print_fn(f"Saved XSA beta diagnostics plot: {svg_path}", console=True)
-
-        if "causal-interventions" in args.xsa_interp_tests:
-            print_fn("Running XSA causal intervention interp on the trained checkpoint behavior", console=True)
-            conditions = build_xsa_intervention_suite()
-            condition_names = xsa_intervention_condition_names(conditions)
-            print_fn(f"Evaluating {len(conditions)} causal intervention condition(s)", console=True)
-            token_class_masks = _build_token_class_masks(model.vocab_size)
-            causal_recorder = None
-            val_loader = distributed_data_generator(
-                args.val_files,
-                args.xsa_interp_batch_size,
-                -1,
-                grad_accum_steps=grad_accum_steps,
-                align_to_bos=False,
-            )
-            with torch.no_grad():
-                for _ in range(args.xsa_interp_batches):
-                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                    bucket_masks = _loss_slice_bucket_masks(
-                        inputs.detach().cpu().numpy(),
-                        targets.detach().cpu().numpy(),
-                        cum_seqlens.detach().cpu().numpy(),
-                        model.vocab_size,
-                        token_class_masks,
-                    )
-                    if causal_recorder is None:
-                        causal_recorder = XSALossSliceRecorder(condition_names, [name for name, _ in bucket_masks])
-                    losses_by_condition = []
-                    for condition in conditions:
-                        xsa_intervention_config = condition
-                        args.xsa_mode = "record"
-                        losses_by_condition.append(
-                            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).detach()
-                        )
-                    causal_recorder.record(losses_by_condition, bucket_masks)
-            del val_loader
-            xsa_intervention_config = None
-            if causal_recorder is not None:
-                causal_recorder.sync_distributed()
-                data = causal_recorder.as_numpy()
-                data["interp_test"] = np.array("causal-interventions")
-                data["baseline_condition"] = np.array(condition_names[0])
-                data["condition_kind"] = np.array(["baseline" if c is None else c.kind for c in conditions])
-                data["condition_strength"] = np.array([0.0 if c is None else c.strength for c in conditions])
-                data["condition_diag_mass"] = np.array([0.0 if c is None else c.diag_mass for c in conditions])
-                data["condition_layers"] = np.array([
-                    "all" if c is None or c.layers is None else _xsa_intervention_layer_label(c.layers)
-                    for c in conditions
-                ])
-                data["condition_token_filter"] = np.array(["all" if c is None else c.token_filter for c in conditions])
-                data["condition_apply_learned_xsa_after"] = np.array([
-                    False if c is None else c.apply_learned_xsa_after for c in conditions
-                ])
-                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
-                data["xsa_interp_schedule_step"] = np.array(schedule_step)
-                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
-                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
-                data["xsa_intervention_quantile"] = np.array(args.xsa_intervention_quantile)
-                data["xsa_intervention_shuffle_shift"] = np.array(args.xsa_intervention_shuffle_shift)
-                if master_process:
-                    from xsa_interp import save_xsa_causal_intervention_outputs
-
-                    npz_path, svg_path = save_xsa_causal_intervention_outputs(data, args.xsa_interp_dir, args.run_id)
-                    print_fn(f"Saved XSA causal intervention metrics: {npz_path}", console=True)
-                    print_fn(f"Saved XSA causal intervention plot: {svg_path}", console=True)
     finally:
         args.xsa_mode = original_xsa_mode
-        xsa_interp_active = False
         xsa_interp_recorder = None
         xsa_attention_diag_recorder = None
-        xsa_beta_diag_recorder = None
-        xsa_intervention_config = None
 
 
 if args.xsa_interp:
@@ -3788,7 +3153,6 @@ else:
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
                          optimizer=training_manager.get_state()) # save the initial state
     train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-    train_loader_started = False
     val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
     transition_steps = training_manager.get_transition_steps()
@@ -3804,11 +3168,7 @@ else:
         model.train()
         for idx in range(grad_accum_steps):
             send_args = training_manager.train_loader_send_args
-            (inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu), train_loader_started = next_data_batch(
-                train_loader,
-                send_args,
-                train_loader_started,
-            )
+            inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(send_args)
             training_manager.sparse_index_update(step, bigram_cpu)
             loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
             training_manager.sparse_index_share(step)
@@ -3826,7 +3186,6 @@ model.train()
 #        Training and validation       #
 ########################################
 train_loader = distributed_data_generator(args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, grad_accum_steps=grad_accum_steps)
-train_loader_started = False
 
 gc.collect()
 
@@ -3836,9 +3195,6 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
-if args.train_steps_override is not None:
-    train_steps = args.train_steps_override
-    print0(f"Overriding training loop to {train_steps} optimizer steps", console=True)
 if args.max_train_steps is not None:
     train_steps = min(train_steps, args.max_train_steps)
     print0(f"Capping training loop at {train_steps} optimizer steps", console=True)
@@ -3852,7 +3208,7 @@ if resume_step:
         training_manager.advance_schedule(skipped_step)
         for _ in range(grad_accum_steps):
             next_args = training_manager.train_loader_send_args
-            _, train_loader_started = next_data_batch(train_loader, next_args, train_loader_started)
+            next(train_loader) if next_args is None else train_loader.send(next_args)
     training_manager.advance_schedule(resume_step)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -3953,11 +3309,7 @@ for step in range(resume_step, train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     for idx in range(grad_accum_steps):
-        (inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu), train_loader_started = next_data_batch(
-            train_loader,
-            training_manager.train_loader_send_args,
-            train_loader_started,
-        )
+        inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu = train_loader.send(training_manager.train_loader_send_args)
         training_manager.sparse_index_update(step, bigram_cpu)
         loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
         training_manager.sparse_index_share(step)
@@ -3969,14 +3321,6 @@ for step in range(resume_step, train_steps + 1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     completed_since_start = step + 1 - resume_step
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/completed_since_start:.2f}ms", console=True)
-
-completed_train_step = train_steps
-
-if args.post_train_xsa_interp:
-    model.eval()
-    interp_model = getattr(model, "_orig_mod", model)
-    run_xsa_interp(interp_model, training_manager, print0)
-    model.train()
 
 if args.run_evals:
     model.eval()
@@ -3990,3 +3334,1578 @@ if args.run_evals:
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
+
+
+----------------------------------------
+# triton_kernels.py
+----------------------------------------
+
+import torch
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+# -----------------------------------------------------------------------------
+# Triton kernel for symmetric matrix multiplication by @byronxu99
+
+@triton.jit
+def _pid_to_block(
+    pid,
+    M,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+
+    # Map PID to a single matrix in batch
+    batch_idx = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    # Map PID to 2D grid of blocks
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    m_idx = pid_m * BLOCK_SIZE_M
+    n_idx = pid_n * BLOCK_SIZE_N
+    return batch_idx, m_idx, n_idx
+
+@triton.jit
+def XXT_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Load A blocks for C[m,n] = A[m,:] @ A[n,:].T
+    # Load A[m, k] -> shape (BM, BK)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    # Load A[n, k] -> shape (BN, BK). Transpose to get (BK, BN) for accumulation.
+    # Loading (BN, BK) is coalesced because stride_c is 1 (contiguous dim is k).
+    at_ptrs = A_ptr + (offs_n[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at_temp = tl.load(at_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at = tl.trans(at_temp)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def XXT(A: torch.Tensor, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = A @ A.T
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M, "Output matrix has incorrect shape"
+    assert out.size(-1) == M, "Output matrix has incorrect shape"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded configs based on H100 autotuning
+    if K == 768:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+        num_stages, num_warps = 4, 8
+    else:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
+        num_stages, num_warps = 4, 8
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    XXT_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+# -----------------------------------------------------------------------------
+# Triton kernel for X.T @ X (tall matrices)
+# Computes C = A.T @ A where A is (M, K) and output C is (K, K)
+
+@triton.jit
+def XTX_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    """
+    Compute C = A.T @ A where A is (M, K) and C is (K, K).
+    This is the transpose variant of XXT for tall matrices.
+    
+    The output matrix C is symmetric, so we compute upper triangle and mirror.
+    We iterate over blocks of M (the reduction dimension after transpose).
+    """
+    pid = tl.program_id(axis=0)
+    # Note: Output is (K, K), so we use K for the output grid
+    batch_idx, k_idx, n_idx = _pid_to_block(
+        pid, K, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed (symmetry optimization)
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= k_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (k_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # For A.T @ A:
+    # - A.T has shape (K, M), so A.T[k, m] = A[m, k]
+    # - We load blocks from columns k_idx and n_idx of A (which are rows of A.T)
+    # - We reduce over M (the shared dimension)
+    offs_k = (k_idx + tl.arange(0, BLOCK_SIZE_M)) % K  # Output row indices (columns of A)
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % K  # Output col indices (columns of A)
+    offs_m = tl.arange(0, BLOCK_SIZE_K)  # Reduction dimension (rows of A)
+
+    # Pointers for loading A[:, k_idx:k_idx+BLOCK] (transposed view is A.T[k_idx:, :])
+    # at_ptrs loads A.T block: A.T[offs_k, offs_m] = A[offs_m, offs_k]
+    at_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    # a_ptrs loads A block for the other factor: A.T[offs_m, offs_n].T = A[offs_m, offs_n]
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_n[None, :] * a_stride_c)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of M (the reduction dimension)
+    for m in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        m_remaining = M - m * BLOCK_SIZE_K
+        # Load A.T[offs_k, offs_m] = A[offs_m, offs_k] -> shape (BLOCK_K, BLOCK_M)
+        at = tl.load(at_ptrs, mask=offs_m[:, None] < m_remaining, other=0.0)
+        # Load A[offs_m, offs_n] -> shape (BLOCK_K, BLOCK_N)
+        a = tl.load(a_ptrs, mask=offs_m[:, None] < m_remaining, other=0.0)
+        # C[k, n] = sum_m A.T[k, m] * A[m, n] = sum_m A[m, k] * A[m, n]
+        # at.T @ a: (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) = (BLOCK_M, BLOCK_N)
+        accumulator = tl.dot(at.T, a, accumulator)
+        at_ptrs += BLOCK_SIZE_K * a_stride_r
+        a_ptrs += BLOCK_SIZE_K * a_stride_r
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_ck = k_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_ck[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_ck[:, None] < K) & (offs_cn[None, :] < K)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal (symmetry)
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_ck[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < K) & (offs_ck[None, :] < K)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+
+def XTX(A: torch.Tensor, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = A.T @ A
+    
+    For tall matrices (M > K), this is more efficient than transposing
+    and using XXT because the intermediate products are smaller (K x K vs M x M).
+    
+    Args:
+        A: Input tensor of shape (M, K) or (batch, M, K)
+        out: Output tensor of shape (K, K) or (batch, K, K)
+    
+    Returns:
+        out: The same output tensor, filled with A.T @ A
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == K, f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
+    assert out.size(-1) == K, f"Output matrix has incorrect shape: expected ({K}, {K}), got {tuple(out.shape[-2:])}"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded configs based on H100 autotuning
+    if K == 768:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+        num_stages, num_warps = 4, 8
+    else:
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 128, 128
+        num_stages, num_warps = 4, 8
+
+    grid = (batch_size * triton.cdiv(K, BLOCK_SIZE_M) * triton.cdiv(K, BLOCK_SIZE_N),)
+    XTX_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+
+@triton.jit
+def ba_plus_cAA_kernel(
+    A_ptr, C_ptr,
+    M,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
+    # Performance is slightly slower than XXT_kernel, so we use two separate kernels
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Coalesced loads similar to XXT_kernel
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_n[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        k_remaining = M - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at_temp = tl.load(at_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        at = tl.trans(at_temp)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    # Load block of A to add (corresponds to the current block of C)
+    offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
+    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
+    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
+
+    # Apply alpha and beta
+    accumulator *= alpha
+    accumulator += a_add * beta
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert M == K, "Input matrix must be square"
+    assert out.size(-2) == M
+    assert out.size(-1) == M
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    # Hardcoded config based on H100 autotuning (M=768)
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 128, 128, 64
+    num_stages, num_warps = 4, 8
+
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    ba_plus_cAA_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=alpha,
+        beta=beta,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+# -----------------------------------------------------------------------------
+# Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
+
+@triton.jit
+def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+                                 M, N, K,
+                                 BLOCK_SIZE_M: tl.constexpr,
+                                 BLOCK_SIZE_N: tl.constexpr,
+                                 BLOCK_SIZE_K: tl.constexpr,
+                                 GROUP_SIZE_M: tl.constexpr,
+                                 NUM_SMS: tl.constexpr,
+                                 FORWARD: tl.constexpr,
+                                 ):
+    dtype = tl.bfloat16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    tile_id_c = start_pid - NUM_SMS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        tile_id_c += NUM_SMS
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_am_c = pid_m * BLOCK_SIZE_M
+        offs_bn_c = pid_n * BLOCK_SIZE_N
+
+        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
+
+        c0 = acc0.to(dtype)
+        if not FORWARD:
+            c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
+            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c], c0)
+
+        if FORWARD:
+            c0_post = tl.maximum(c0, 0)
+            c0_post = c0_post * c0_post
+            aux_desc.store([offs_am_c, offs_bn_c], c0_post)
+
+        c1 = acc1.to(dtype)
+        if not FORWARD:
+            c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
+            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+
+        c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
+
+        if FORWARD:
+            c1_post = tl.maximum(c1, 0)
+            c1_post = c1_post * c1_post
+            aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
+
+
+def linear_relu_square(a, b, aux=None):
+    M, K = a.shape
+    N, K = b.shape
+    dtype = a.dtype
+
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    FORWARD = False
+    if aux is None:
+        FORWARD = True
+        aux = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 64
+    num_stages = 4 if FORWARD else 3
+    num_warps = 8
+
+    a_desc = TensorDescriptor.from_tensor(a, [BLOCK_SIZE_M, BLOCK_SIZE_K])
+    b_desc = TensorDescriptor.from_tensor(b, [BLOCK_SIZE_N, BLOCK_SIZE_K])
+    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+    aux_desc = TensorDescriptor.from_tensor(aux, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2])
+
+    def grid(META):
+        return (min(
+            NUM_SMS,
+            triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        ), )
+
+    linear_relu_square_kernel[grid](
+        a_desc, b_desc, c_desc, aux_desc,
+        M, N, K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=1,
+        NUM_SMS=NUM_SMS,
+        FORWARD=FORWARD,
+        num_stages=num_stages,
+        num_warps=num_warps
+    )
+
+    if FORWARD:
+        return c, aux
+    else:
+        return c
+
+class FusedLinearReLUSquareFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W1, W2):
+        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        x3 = post @ W2
+        ctx.save_for_backward(x, W1, W2, pre, post)
+        return x3.view(x.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, W1, W2, pre, post = ctx.saved_tensors
+        dW2 = post.T @ grad_output
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        dW1 = dpre.T @ x
+        dx = dpre @ W1
+        return dx.view(x.shape), dW1, dW2
+
+
+# -----------------------------------------------------------------------------
+# Tiled transpose copy kernel: dst (N, M) = src (M, N).T
+# Uses coalesced reads from src and coalesced writes to dst via tl.trans().
+# Replaces PyTorch's elementwise copy_ which uses a naive 75k-block kernel
+# with non-coalesced writes, saturating all SMs and blocking NCCL.
+
+@triton.jit
+def _transpose_copy_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced write to dst (N, M): dst[n, m] = src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    tl.store(
+        dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1,
+        tl.trans(tile), mask=mask_T,
+    )
+
+
+def transpose_copy(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose copy: dst = src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 64x128 tiled Triton kernel with coalesced reads AND writes,
+    achieving near memory-bandwidth-limited performance.
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 64, 128
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_copy_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Tiled transpose-add kernel: dst (M, N) += src (N, M).T
+# Same tiling strategy as transpose_copy but with a fused read-add-write.
+# Replaces PyTorch's .add_(src.T) which uses the same 75k-block elementwise
+# kernel with non-coalesced reads from the transposed operand.
+
+@triton.jit
+def _transpose_add_kernel(
+    src_ptr, dst_ptr,
+    M, N,
+    src_stride_m, src_stride_n,
+    dst_stride_0, dst_stride_1,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    # Coalesced read from src (M, N)
+    src_tile = tl.load(
+        src_ptr + offs_m[:, None] * src_stride_m + offs_n[None, :] * src_stride_n,
+        mask=mask, other=0.0,
+    )
+
+    # Coalesced read-add-write on dst (N, M): dst[n, m] += src[m, n]
+    mask_T = (offs_n[:, None] < N) & (offs_m[None, :] < M)
+    dst_ptrs = dst_ptr + offs_n[:, None] * dst_stride_0 + offs_m[None, :] * dst_stride_1
+    dst_tile = tl.load(dst_ptrs, mask=mask_T, other=0.0)
+    tl.store(dst_ptrs, dst_tile + tl.trans(src_tile), mask=mask_T)
+
+
+def transpose_add(src: torch.Tensor, dst: torch.Tensor):
+    """Tiled transpose-add: dst += src.T where src is (M, N) and dst is (N, M).
+
+    Uses a 32x32 tiled Triton kernel with coalesced access on both src and dst,
+    replacing PyTorch's .add_(src.T) which has non-coalesced reads from the
+    transposed operand.
+    """
+    assert src.ndim == 2 and dst.ndim == 2
+    M, N = src.shape
+    assert dst.shape == (N, M), f"Expected dst shape ({N}, {M}), got {dst.shape}"
+
+    BLOCK_M, BLOCK_N = 32, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _transpose_add_kernel[grid](
+        src, dst,
+        M, N,
+        src.stride(0), src.stride(1),
+        dst.stride(0), dst.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+CE_KERNEL_BLOCK_SIZE = 256
+CE_KERNEL_VOCAB_SIZE = 50304
+
+CE_KERNEL_DECLS = f"""
+constexpr int VOCAB_SIZE = {CE_KERNEL_VOCAB_SIZE};
+constexpr int BLOCK_SIZE = {CE_KERNEL_BLOCK_SIZE};
+"""
+
+CE_KERNEL_SOURCE = """
+#include <cuda_bf16.h>
+#include <math_constants.h>
+
+#define __nv_fp8_e5m2 char
+#define uint16_t unsigned short
+#define uint8_t unsigned char
+#define int64_t long long
+
+__device__ __forceinline__ __nv_fp8_e5m2 f32_to_fp8_e5m2(float x) {
+    uint16_t packed;
+    asm volatile(
+        "cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
+        : "=h"(packed)
+        : "f"(x), "f"(0.0f)
+    );
+    __nv_fp8_e5m2 result;
+    *reinterpret_cast<uint8_t*>(&result) = (packed & (0xFF << 8)) >> 8;
+    return result;
+}
+
+struct __align__(16) __nv_bfloat168 {
+    __nv_bfloat16 data[8];
+    __device__ __nv_bfloat16& operator[](int i) { return data[i]; }
+    __device__ const __nv_bfloat16& operator[](int i) const { return data[i]; }
+};
+
+struct __align__(8) __nv_fp8_e5m28 {
+    __nv_fp8_e5m2 data[8];
+    __device__ __nv_fp8_e5m2& operator[](int i) { return data[i]; }
+    __device__ const __nv_fp8_e5m2& operator[](int i) const { return data[i]; }
+};
+
+template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b - 1) / b; }
+
+//__device__ float sigmoid(float x) {
+//  return 1.0f / (1.0f + __expf(-x));
+//}
+__device__ float sigmoid(float x) {
+  return 0.5f + tanhf(x * 0.5f) * 0.5f;
+}
+
+extern "C"
+__launch_bounds__(BLOCK_SIZE, 2)
+__global__ void ce_fwd_bwd_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    const int64_t* __restrict__ targets,
+    const float* __restrict__ mtp_weights,
+    float* __restrict__ losses,
+    __nv_fp8_e5m2* grad_input,
+    int batch_size,
+    int n_predict,
+    double A_param,
+    double B_param,
+    double C_param,
+    double grad_s_param,
+    double grad_scale_param)
+{
+  constexpr int VEC_WIDTH = 8;
+  constexpr int NUM_FULL_LOADS = VOCAB_SIZE / (BLOCK_SIZE * VEC_WIDTH);
+  constexpr int NUM_LOADS = CEIL_DIV(VOCAB_SIZE, BLOCK_SIZE * VEC_WIDTH);
+
+  float A = (float)A_param;
+  float B = (float)B_param;
+  float C = (float)C_param;
+  float grad_s = (float)grad_s_param;
+  float grad_scale = (float)grad_scale_param;
+
+  extern __shared__ __nv_bfloat16 smem[];
+
+  static_assert(VEC_WIDTH == 8);
+
+  const __nv_bfloat16 *block_logit_ptr = logits + VOCAB_SIZE * blockIdx.x;
+
+  float inv_C = 1 / C;
+  float B_div_C = B * inv_C;
+  float thread_max = -CUDART_INF_F;
+
+  #pragma unroll 25
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 result = *(__nv_bfloat168*)(&block_logit_ptr[idx]);
+      __nv_bfloat168 result_sigmoid;
+      #pragma unroll
+      for (int k = 0; k < VEC_WIDTH; k++) {
+        float tmp = __bfloat162float(result[k]);
+        tmp = sigmoid(tmp * inv_C + B_div_C);
+        result_sigmoid[k] = __float2bfloat16(tmp);
+        tmp = A * tmp;
+        thread_max = max(tmp, thread_max);
+      }
+      *(__nv_bfloat168*)(&smem[idx]) = result_sigmoid;
+    }
+  }
+
+  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+  int warp_id = threadIdx.x / 32;
+  __shared__ float block_maxs[NUM_WARPS];
+  __shared__ float block_sums[NUM_WARPS];
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
+
+  if (threadIdx.x % 32 == 0) {
+    block_maxs[warp_id] = thread_max;
+  }
+
+  __syncthreads();
+
+  float block_max = -CUDART_INF_F;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_max = fmaxf(block_max, block_maxs[i]);
+  }
+
+  float thread_sum = 0.0f;
+  #pragma unroll 2
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_bfloat168 l;
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      l = *(__nv_bfloat168*)(&smem[idx]);
+    }
+    #pragma unroll
+    for (int k = 0; k < VEC_WIDTH; k++) {
+      float tmp = A * __bfloat162float(l[k]);
+      tmp = __expf(tmp - block_max);
+      if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+        thread_sum += tmp;
+      }
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1)
+    thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+
+  if (threadIdx.x % 32 == 0) {
+    block_sums[warp_id] = thread_sum;
+  }
+
+  __syncthreads();
+
+  float block_sum = 0.0f;
+  for (int i = 0; i < NUM_WARPS; i++) {
+    block_sum += block_sums[i];
+  }
+
+  float lse = block_max + __logf(block_sum);
+
+  if (threadIdx.x == 0) {
+    float total_loss = 0.0f;
+    for (int k = 0; k < n_predict; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size) {
+        float weight = mtp_weights[k];
+        int64_t target = targets[target_idx];
+        if (target >= 0 && target < VOCAB_SIZE) {
+          float z_target = A * __bfloat162float(smem[target]);
+          total_loss += weight * (lse - z_target);
+        }
+      }
+    }
+    losses[blockIdx.x] = total_loss;
+  }
+
+  float S_w = 0.0f;
+
+  for (int i = 0; i < n_predict; i++) {
+    S_w += mtp_weights[i];
+  }
+
+  #pragma unroll 4
+  for (int i = 0; i < NUM_LOADS; i++) {
+    int idx = i * BLOCK_SIZE * VEC_WIDTH + threadIdx.x * VEC_WIDTH;
+    __nv_fp8_e5m28 result;
+
+    if (i < NUM_FULL_LOADS || idx < VOCAB_SIZE) {
+      __nv_bfloat168 sigmoid_us = *(__nv_bfloat168*)(&smem[idx]);
+      #pragma unroll
+      for (int j = 0; j < VEC_WIDTH; j++) {
+        float sigmoid_u = __bfloat162float(sigmoid_us[j]);
+        float z = A * sigmoid_u;
+        float p = __expf(z - lse);
+
+        float term1 = S_w * p;
+        float term2 = 0.0f;
+
+        float grad_z = term1 - term2;
+        float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+        auto result_tmp = f32_to_fp8_e5m2(grad_x);
+        result[j] = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+      }
+      *(__nv_fp8_e5m28*)(&grad_input[blockIdx.x * VOCAB_SIZE + idx]) = result;
+    }
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x < n_predict && blockIdx.x + threadIdx.x < batch_size) {
+    int i = threadIdx.x;
+    int64_t target = targets[blockIdx.x + i];
+
+    float sigmoid_u = __bfloat162float(smem[target]);
+    float z = A * sigmoid_u;
+    float p = __expf(z - lse);
+
+    float term1 = S_w * p;
+    float term2 = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < 3; k++) {
+      int64_t target_idx = blockIdx.x + k;
+      if (target_idx < batch_size && k < n_predict) {
+        if (targets[target_idx] == target) {
+          term2 += mtp_weights[k];
+        }
+      }
+    }
+
+    float grad_z = term1 - term2;
+    float grad_x = grad_scale * (1.0f / C * A) * (1.0f / grad_s) * grad_z * sigmoid_u * (1.0f - sigmoid_u);
+    auto result_tmp = f32_to_fp8_e5m2(grad_x);
+    auto result = *reinterpret_cast<__nv_fp8_e5m2*>(&result_tmp);
+    grad_input[blockIdx.x * VOCAB_SIZE + target] = result;
+  }
+}
+"""
+
+ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+    "ce_fwd_bwd_kernel",
+    compute_capability="90",
+    cuda_include_dirs=["/usr/local/cuda/include/"],
+    nvcc_options=["-lineinfo", "--use_fast_math"],
+)
+ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+
+@torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
+def ce_fwd_bwd(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mtp_weights: torch.Tensor,
+    losses: torch.Tensor,
+    grad_input: torch.Tensor,
+    n_rows: int,
+    n_predict: int,
+    A: float,
+    B: float,
+    C: float,
+    grad_s: float,
+    grad_scale: float,
+) -> None:
+    grid = (n_rows, 1, 1)
+    ce_fwd_bwd_kernel(
+        grid,
+        (CE_KERNEL_BLOCK_SIZE, 1, 1),
+        (logits, targets, mtp_weights, losses, grad_input,
+         n_rows, n_predict, A, B, C, grad_s, grad_scale),
+        shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
+    )
+
+class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
+
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+
+        w_f8_col_major = w_f8.T.contiguous().T
+
+        logits = torch._scaled_mm(
+            x_f8,
+            w_f8_col_major,
+            out_dtype=torch.bfloat16,
+            scale_a=x.new_tensor(x_s, dtype=torch.float32),
+            scale_b=x.new_tensor(w_s, dtype=torch.float32),
+            use_fast_accum=True,
+        )
+
+        n_rows, n_cols = logits.shape
+        if mtp_weights is None:
+             mtp_weights = torch.tensor([1.0], device=logits.device, dtype=torch.float32)
+        n_predict = mtp_weights.shape[0]
+
+        losses = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+        lse = torch.empty(n_rows, dtype=torch.float32, device=logits.device)
+
+        logits = logits.contiguous()
+        targets = targets.contiguous()
+        mtp_weights = mtp_weights.contiguous()
+
+        grad_input = torch.empty((n_rows, n_cols), dtype=torch.float8_e5m2, device=logits.device)
+
+        ce_fwd_bwd(logits, targets, mtp_weights, losses, grad_input,
+             n_rows, n_predict, A, B, C, grad_s, grad_scale)
+
+        ctx.save_for_backward(logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input)
+        ctx.params = (A, B, C, x_s, w_s, grad_s)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, mtp_weights, lse, x, lm_head_weight, x_f8, w_f8, grad_input = ctx.saved_tensors
+        A, B, C, x_s, w_s, grad_s = ctx.params
+        n_rows, n_cols = logits.shape
+        n_predict = mtp_weights.shape[0]
+
+        grad_output = grad_output.contiguous()
+
+        x_scale = grad_input.new_tensor(x_s, dtype=torch.float32)
+        w_scale = grad_input.new_tensor(w_s, dtype=torch.float32)
+        grad_scale = grad_input.new_tensor(grad_s, dtype=torch.float32)
+
+        grad_x = torch._scaled_mm(
+            grad_input,
+            w_f8.T,
+            out_dtype=torch.bfloat16,
+            scale_a=grad_scale,
+            scale_b=w_scale,
+            use_fast_accum=False,
+        )
+
+        x_f8_T = torch.empty((x_f8.shape[1], x_f8.shape[0]), dtype=x_f8.dtype, device=x_f8.device)
+        transpose_copy(x_f8, x_f8_T)  # (768, n_rows) row-major
+
+        grad_input_T = torch.empty((n_cols, n_rows), dtype=grad_input.dtype, device=grad_input.device)
+        transpose_copy(grad_input, grad_input_T)  # (50304, n_rows) row-major
+
+        grad_w = torch._scaled_mm(
+            x_f8_T,            # (768, n_rows) row-major
+            grad_input_T.T,    # (n_rows, 50304) column-major view
+            out_dtype=torch.float32,
+            scale_a=x_scale,
+            scale_b=grad_scale,
+            use_fast_accum=False,
+        )
+
+        return grad_x, None, None, grad_w, None, None, None
+
+====================================================================================================
+Running Python 3.11.13 | packaged by conda-forge | (main, Jun  4 2025, 14:48:23) [GCC 13.3.0]
+Running PyTorch 2.10.0+cu126 compiled for CUDA 12.6
+Running Triton version 3.6.0
+Train files pattern: /root/xsa_gate_ablation/data/fineweb10B/fineweb_train_*.bin
+Val files pattern: /root/xsa_gate_ablation/data/fineweb10B/fineweb_val_*.bin
+Log dir: /root/xsa_gate_ablation/logs
+Checkpoint dir: /root/xsa_gate_ablation/checkpoints
+Load checkpoint: None
+Load optimizer: False
+Num scheduled iterations: 1375
+Num extension iterations: 10
+Max train steps: 500
+Skip warmup: True
+Skip validation: False
+Extra val steps: ()
+XSA mode: substoch
+Model XSA lambda: 1.0
+Output metric detach: False
+Output metric bf16 projection: False
+Disable attention gate: False
+XSA interp: False
+XSA interp tests: ('alignment',)
+XSA interp modes: ('record', 'none', 'value', 'output-metric-diag')
+XSA interp batches: 1
+XSA interp batch size: 131072
+XSA interp dir: xsa_interp_logs
+XSA interp step: None
+XSA interp final ws: True
+Val every after step: None
+Stop val loss below: None
+Tue May 26 02:32:53 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:07:00.0 Off |                    0 |
+| N/A   32C    P0            118W /  700W |    1185MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            9549      C   ...te_ablation/.venv/bin/python3       1176MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Skipping kernel warmup
+Capping training loop at 500 optimizer steps
+step:0/500 val_loss:10.8290 train_time:0ms step_avg:0.18ms
+step:1/500 train_time:86803ms step_avg:86802.56ms
+step:2/500 train_time:92644ms step_avg:46321.79ms
+step:3/500 train_time:92843ms step_avg:30947.71ms
+step:4/500 train_time:93082ms step_avg:23270.43ms
+step:5/500 train_time:93320ms step_avg:18663.98ms
+step:6/500 train_time:93558ms step_avg:15593.05ms
+step:7/500 train_time:93801ms step_avg:13400.19ms
+step:8/500 train_time:94041ms step_avg:11755.16ms
+step:9/500 train_time:94281ms step_avg:10475.65ms
+step:10/500 train_time:94520ms step_avg:9451.95ms
+step:11/500 train_time:94761ms step_avg:8614.65ms
+step:12/500 train_time:95002ms step_avg:7916.85ms
+step:13/500 train_time:95243ms step_avg:7326.38ms
+step:14/500 train_time:95483ms step_avg:6820.24ms
+step:15/500 train_time:95724ms step_avg:6381.58ms
+step:16/500 train_time:95964ms step_avg:5997.76ms
+step:17/500 train_time:96206ms step_avg:5659.15ms
+step:18/500 train_time:96445ms step_avg:5358.05ms
+step:19/500 train_time:96685ms step_avg:5088.69ms
+step:20/500 train_time:96925ms step_avg:4846.26ms
+step:21/500 train_time:97165ms step_avg:4626.92ms
+step:22/500 train_time:97405ms step_avg:4427.52ms
+step:23/500 train_time:97646ms step_avg:4245.48ms
+step:24/500 train_time:97886ms step_avg:4078.57ms
+step:25/500 train_time:98126ms step_avg:3925.05ms
+step:26/500 train_time:98366ms step_avg:3783.29ms
+step:27/500 train_time:98606ms step_avg:3652.06ms
+step:28/500 train_time:98846ms step_avg:3530.21ms
+step:29/500 train_time:99086ms step_avg:3416.77ms
+step:30/500 train_time:99326ms step_avg:3310.88ms
+step:31/500 train_time:99567ms step_avg:3211.83ms
+step:32/500 train_time:99807ms step_avg:3118.96ms
+step:33/500 train_time:100048ms step_avg:3031.75ms
+step:34/500 train_time:100288ms step_avg:2949.64ms
+step:35/500 train_time:100528ms step_avg:2872.22ms
+step:36/500 train_time:100767ms step_avg:2799.08ms
+step:37/500 train_time:101008ms step_avg:2729.94ms
+step:38/500 train_time:101247ms step_avg:2664.40ms
+step:39/500 train_time:101488ms step_avg:2602.26ms
+step:40/500 train_time:101727ms step_avg:2543.18ms
+step:41/500 train_time:101967ms step_avg:2487.01ms
+step:42/500 train_time:102208ms step_avg:2433.51ms
+step:43/500 train_time:102449ms step_avg:2382.52ms
+step:44/500 train_time:102689ms step_avg:2333.84ms
+step:45/500 train_time:102929ms step_avg:2287.30ms
+step:46/500 train_time:103168ms step_avg:2242.78ms
+step:47/500 train_time:103408ms step_avg:2200.17ms
+step:48/500 train_time:103651ms step_avg:2159.39ms
+step:49/500 train_time:103888ms step_avg:2120.16ms
+step:50/500 train_time:104127ms step_avg:2082.54ms
+step:51/500 train_time:104367ms step_avg:2046.42ms
+step:52/500 train_time:104608ms step_avg:2011.68ms
+step:53/500 train_time:104851ms step_avg:1978.31ms
+step:54/500 train_time:105089ms step_avg:1946.09ms
+step:55/500 train_time:105329ms step_avg:1915.08ms
+step:56/500 train_time:105573ms step_avg:1885.23ms
+step:57/500 train_time:105811ms step_avg:1856.33ms
+step:58/500 train_time:106052ms step_avg:1828.48ms
+step:59/500 train_time:106294ms step_avg:1801.59ms
+step:60/500 train_time:106535ms step_avg:1775.58ms
+step:61/500 train_time:106776ms step_avg:1750.43ms
+step:62/500 train_time:107017ms step_avg:1726.08ms
+step:63/500 train_time:107259ms step_avg:1702.52ms
+step:64/500 train_time:107500ms step_avg:1679.69ms
+step:65/500 train_time:107741ms step_avg:1657.55ms
+step:66/500 train_time:107981ms step_avg:1636.08ms
+step:67/500 train_time:108223ms step_avg:1615.27ms
+step:68/500 train_time:108465ms step_avg:1595.07ms
+step:69/500 train_time:108706ms step_avg:1575.45ms
+step:70/500 train_time:108946ms step_avg:1556.38ms
+step:71/500 train_time:109187ms step_avg:1537.85ms
+step:72/500 train_time:109428ms step_avg:1519.84ms
+step:73/500 train_time:109670ms step_avg:1502.33ms
+step:74/500 train_time:109911ms step_avg:1485.29ms
+step:75/500 train_time:110154ms step_avg:1468.72ms
+step:76/500 train_time:110397ms step_avg:1452.59ms
+step:77/500 train_time:110638ms step_avg:1436.85ms
+step:78/500 train_time:110879ms step_avg:1421.52ms
+step:79/500 train_time:111120ms step_avg:1406.58ms
+step:80/500 train_time:111362ms step_avg:1392.02ms
+step:81/500 train_time:111604ms step_avg:1377.83ms
+step:82/500 train_time:111846ms step_avg:1363.97ms
+step:83/500 train_time:112087ms step_avg:1350.45ms
+step:84/500 train_time:112328ms step_avg:1337.24ms
+step:85/500 train_time:112569ms step_avg:1324.34ms
+step:86/500 train_time:112811ms step_avg:1311.75ms
+step:87/500 train_time:113054ms step_avg:1299.47ms
+step:88/500 train_time:113296ms step_avg:1287.45ms
+step:89/500 train_time:113538ms step_avg:1275.71ms
+step:90/500 train_time:113779ms step_avg:1264.21ms
+step:91/500 train_time:114021ms step_avg:1252.98ms
+step:92/500 train_time:114263ms step_avg:1241.99ms
+step:93/500 train_time:114506ms step_avg:1231.25ms
+step:94/500 train_time:114747ms step_avg:1220.71ms
+step:95/500 train_time:114988ms step_avg:1210.40ms
+step:96/500 train_time:115229ms step_avg:1200.30ms
+step:97/500 train_time:115472ms step_avg:1190.43ms
+step:98/500 train_time:115714ms step_avg:1180.75ms
+step:99/500 train_time:115956ms step_avg:1171.27ms
+step:100/500 train_time:116197ms step_avg:1161.97ms
+step:100/500 val_loss:5.0059 train_time:116238ms step_avg:1162.38ms
+step:101/500 train_time:116445ms step_avg:1152.92ms
+step:102/500 train_time:116685ms step_avg:1143.97ms
+step:103/500 train_time:116926ms step_avg:1135.21ms
+step:104/500 train_time:117167ms step_avg:1126.60ms
+step:105/500 train_time:117411ms step_avg:1118.20ms
+step:106/500 train_time:117651ms step_avg:1109.92ms
+step:107/500 train_time:117892ms step_avg:1101.80ms
+step:108/500 train_time:118133ms step_avg:1093.82ms
+step:109/500 train_time:118375ms step_avg:1086.01ms
+step:110/500 train_time:118617ms step_avg:1078.34ms
+step:111/500 train_time:118860ms step_avg:1070.81ms
+step:112/500 train_time:119101ms step_avg:1063.40ms
+step:113/500 train_time:119344ms step_avg:1056.14ms
+step:114/500 train_time:119585ms step_avg:1048.99ms
+step:115/500 train_time:119828ms step_avg:1041.98ms
+step:116/500 train_time:120070ms step_avg:1035.08ms
+step:117/500 train_time:120311ms step_avg:1028.30ms
+step:118/500 train_time:120553ms step_avg:1021.63ms
+step:119/500 train_time:120794ms step_avg:1015.08ms
+step:120/500 train_time:121036ms step_avg:1008.63ms
+step:121/500 train_time:121277ms step_avg:1002.29ms
+step:122/500 train_time:121520ms step_avg:996.06ms
+step:123/500 train_time:121762ms step_avg:989.94ms
+step:124/500 train_time:122004ms step_avg:983.90ms
+step:125/500 train_time:122246ms step_avg:977.97ms
+step:126/500 train_time:122488ms step_avg:972.12ms
+step:127/500 train_time:122731ms step_avg:966.38ms
+step:128/500 train_time:122973ms step_avg:960.72ms
+step:129/500 train_time:123214ms step_avg:955.15ms
+step:130/500 train_time:123454ms step_avg:949.64ms
+step:131/500 train_time:123696ms step_avg:944.24ms
+step:132/500 train_time:123938ms step_avg:938.92ms
+step:133/500 train_time:124181ms step_avg:933.69ms
+step:134/500 train_time:124422ms step_avg:928.52ms
+step:135/500 train_time:124664ms step_avg:923.44ms
+step:136/500 train_time:124906ms step_avg:918.43ms
+step:137/500 train_time:125150ms step_avg:913.50ms
+step:138/500 train_time:125392ms step_avg:908.64ms
+step:139/500 train_time:125634ms step_avg:903.84ms
+step:140/500 train_time:125875ms step_avg:899.11ms
+step:141/500 train_time:126117ms step_avg:894.45ms
+step:142/500 train_time:126360ms step_avg:889.86ms
+step:143/500 train_time:126603ms step_avg:885.34ms
+step:144/500 train_time:126847ms step_avg:880.88ms
+step:145/500 train_time:127087ms step_avg:876.46ms
+step:146/500 train_time:127329ms step_avg:872.11ms
+step:147/500 train_time:127571ms step_avg:867.83ms
+step:148/500 train_time:127814ms step_avg:863.61ms
+step:149/500 train_time:128056ms step_avg:859.44ms
+step:150/500 train_time:128297ms step_avg:855.31ms
+step:151/500 train_time:128540ms step_avg:851.26ms
+step:152/500 train_time:128783ms step_avg:847.26ms
+step:153/500 train_time:129027ms step_avg:843.31ms
+step:154/500 train_time:129269ms step_avg:839.41ms
+step:155/500 train_time:129512ms step_avg:835.56ms
+step:156/500 train_time:129754ms step_avg:831.75ms
+step:157/500 train_time:129996ms step_avg:828.00ms
+step:158/500 train_time:130236ms step_avg:824.28ms
+step:159/500 train_time:130479ms step_avg:820.62ms
+step:160/500 train_time:130721ms step_avg:817.01ms
+step:161/500 train_time:130964ms step_avg:813.44ms
+step:162/500 train_time:131209ms step_avg:809.93ms
+step:163/500 train_time:131452ms step_avg:806.45ms
+step:164/500 train_time:131695ms step_avg:803.02ms
+step:165/500 train_time:131934ms step_avg:799.60ms
+step:166/500 train_time:132175ms step_avg:796.24ms
+step:167/500 train_time:132418ms step_avg:792.92ms
+step:168/500 train_time:132661ms step_avg:789.65ms
+step:169/500 train_time:132905ms step_avg:786.42ms
+step:170/500 train_time:133149ms step_avg:783.23ms
+step:171/500 train_time:133390ms step_avg:780.06ms
+step:172/500 train_time:133631ms step_avg:776.92ms
+step:173/500 train_time:133873ms step_avg:773.83ms
+step:174/500 train_time:134115ms step_avg:770.78ms
+step:175/500 train_time:134357ms step_avg:767.76ms
+step:176/500 train_time:134600ms step_avg:764.77ms
+step:177/500 train_time:134843ms step_avg:761.83ms
+step:178/500 train_time:135086ms step_avg:758.91ms
+step:179/500 train_time:135328ms step_avg:756.02ms
+step:180/500 train_time:135570ms step_avg:753.17ms
+step:181/500 train_time:135813ms step_avg:750.35ms
+step:182/500 train_time:136055ms step_avg:747.55ms
+step:183/500 train_time:136298ms step_avg:744.80ms
+step:184/500 train_time:136540ms step_avg:742.06ms
+step:185/500 train_time:136782ms step_avg:739.36ms
+step:186/500 train_time:137024ms step_avg:736.69ms
+step:187/500 train_time:137268ms step_avg:734.05ms
+step:188/500 train_time:137510ms step_avg:731.44ms
+step:189/500 train_time:137753ms step_avg:728.85ms
+step:190/500 train_time:137994ms step_avg:726.28ms
+step:191/500 train_time:138237ms step_avg:723.75ms
+step:192/500 train_time:138479ms step_avg:721.24ms
+step:193/500 train_time:138723ms step_avg:718.77ms
+step:194/500 train_time:138964ms step_avg:716.31ms
+step:195/500 train_time:139208ms step_avg:713.89ms
+step:196/500 train_time:139450ms step_avg:711.48ms
+step:197/500 train_time:139693ms step_avg:709.10ms
+step:198/500 train_time:139935ms step_avg:706.74ms
+step:199/500 train_time:140177ms step_avg:704.41ms
+step:200/500 train_time:140419ms step_avg:702.09ms
+step:200/500 val_loss:4.5677 train_time:140460ms step_avg:702.30ms
+step:201/500 train_time:140665ms step_avg:699.82ms
+step:202/500 train_time:140906ms step_avg:697.56ms
+step:203/500 train_time:141150ms step_avg:695.32ms
+step:204/500 train_time:141391ms step_avg:693.09ms
+step:205/500 train_time:141634ms step_avg:690.90ms
+step:206/500 train_time:141876ms step_avg:688.72ms
+step:207/500 train_time:142120ms step_avg:686.57ms
+step:208/500 train_time:142362ms step_avg:684.43ms
+step:209/500 train_time:142606ms step_avg:682.32ms
+step:210/500 train_time:142848ms step_avg:680.23ms
+step:211/500 train_time:143091ms step_avg:678.16ms
+step:212/500 train_time:143335ms step_avg:676.11ms
+step:213/500 train_time:143578ms step_avg:674.07ms
+step:214/500 train_time:143820ms step_avg:672.06ms
+step:215/500 train_time:144064ms step_avg:670.07ms
+step:216/500 train_time:144306ms step_avg:668.09ms
+step:217/500 train_time:144549ms step_avg:666.13ms
+step:218/500 train_time:144791ms step_avg:664.18ms
+step:219/500 train_time:145034ms step_avg:662.26ms
+step:220/500 train_time:145277ms step_avg:660.35ms
+step:221/500 train_time:145520ms step_avg:658.46ms
+step:222/500 train_time:145764ms step_avg:656.59ms
+step:223/500 train_time:146007ms step_avg:654.74ms
+step:224/500 train_time:146249ms step_avg:652.90ms
+step:225/500 train_time:146492ms step_avg:651.07ms
+step:226/500 train_time:146734ms step_avg:649.27ms
+step:227/500 train_time:146977ms step_avg:647.48ms
+step:228/500 train_time:147219ms step_avg:645.70ms
+step:229/500 train_time:147463ms step_avg:643.94ms
+step:230/500 train_time:147705ms step_avg:642.20ms
+step:231/500 train_time:147948ms step_avg:640.47ms
+step:232/500 train_time:148190ms step_avg:638.75ms
+step:233/500 train_time:148432ms step_avg:637.05ms
+step:234/500 train_time:148675ms step_avg:635.36ms
+step:235/500 train_time:148918ms step_avg:633.69ms
+step:236/500 train_time:149160ms step_avg:632.03ms
+step:237/500 train_time:149403ms step_avg:630.39ms
+step:238/500 train_time:149645ms step_avg:628.76ms
+step:239/500 train_time:149887ms step_avg:627.14ms
+step:240/500 train_time:150129ms step_avg:625.54ms
+step:241/500 train_time:150372ms step_avg:623.95ms
+step:242/500 train_time:150614ms step_avg:622.37ms
+step:243/500 train_time:150857ms step_avg:620.81ms
+step:244/500 train_time:151100ms step_avg:619.26ms
+step:245/500 train_time:151342ms step_avg:617.72ms
+step:246/500 train_time:151584ms step_avg:616.20ms
+step:247/500 train_time:151827ms step_avg:614.68ms
+step:248/500 train_time:152070ms step_avg:613.18ms
+step:249/500 train_time:152312ms step_avg:611.69ms
+step:250/500 train_time:152554ms step_avg:610.22ms
+step:251/500 train_time:152797ms step_avg:608.75ms
+step:252/500 train_time:153040ms step_avg:607.30ms
+step:253/500 train_time:153282ms step_avg:605.86ms
+step:254/500 train_time:153524ms step_avg:604.43ms
+step:255/500 train_time:153767ms step_avg:603.01ms
+step:256/500 train_time:154010ms step_avg:601.60ms
+step:257/500 train_time:154253ms step_avg:600.21ms
+step:258/500 train_time:154495ms step_avg:598.82ms
+step:259/500 train_time:154738ms step_avg:597.45ms
+step:260/500 train_time:154982ms step_avg:596.09ms
+step:261/500 train_time:155225ms step_avg:594.73ms
+step:262/500 train_time:155467ms step_avg:593.38ms
+step:263/500 train_time:155708ms step_avg:592.05ms
+step:264/500 train_time:155951ms step_avg:590.72ms
+step:265/500 train_time:156194ms step_avg:589.41ms
+step:266/500 train_time:156436ms step_avg:588.11ms
+step:267/500 train_time:156680ms step_avg:586.82ms
+step:268/500 train_time:156923ms step_avg:585.53ms
+step:269/500 train_time:157165ms step_avg:584.26ms
+step:270/500 train_time:157407ms step_avg:582.99ms
+step:271/500 train_time:157649ms step_avg:581.73ms
+step:272/500 train_time:157891ms step_avg:580.48ms
+step:273/500 train_time:158134ms step_avg:579.25ms
+step:274/500 train_time:158377ms step_avg:578.02ms
+step:275/500 train_time:158619ms step_avg:576.80ms
+step:276/500 train_time:158862ms step_avg:575.59ms
+step:277/500 train_time:159105ms step_avg:574.39ms
+step:278/500 train_time:159350ms step_avg:573.20ms
+step:279/500 train_time:159592ms step_avg:572.01ms
+step:280/500 train_time:159835ms step_avg:570.84ms
+step:281/500 train_time:160075ms step_avg:569.66ms
+step:282/500 train_time:160318ms step_avg:568.50ms
+step:283/500 train_time:160562ms step_avg:567.36ms
+step:284/500 train_time:160804ms step_avg:566.21ms
+step:285/500 train_time:161046ms step_avg:565.08ms
+step:286/500 train_time:161289ms step_avg:563.95ms
+step:287/500 train_time:161532ms step_avg:562.83ms
+step:288/500 train_time:161773ms step_avg:561.71ms
+step:289/500 train_time:162017ms step_avg:560.61ms
+step:290/500 train_time:162259ms step_avg:559.51ms
+step:291/500 train_time:162503ms step_avg:558.43ms
+step:292/500 train_time:162745ms step_avg:557.35ms
+step:293/500 train_time:162988ms step_avg:556.27ms
+step:294/500 train_time:163230ms step_avg:555.21ms
+step:295/500 train_time:163472ms step_avg:554.14ms
+step:296/500 train_time:163715ms step_avg:553.09ms
+step:297/500 train_time:163958ms step_avg:552.05ms
+step:298/500 train_time:164201ms step_avg:551.01ms
+step:299/500 train_time:164444ms step_avg:549.98ms
+step:300/500 train_time:164685ms step_avg:548.95ms
+step:300/500 val_loss:4.3764 train_time:164726ms step_avg:549.09ms
+step:301/500 train_time:164931ms step_avg:547.94ms
+step:302/500 train_time:165173ms step_avg:546.93ms
+step:303/500 train_time:165416ms step_avg:545.93ms
+step:304/500 train_time:165657ms step_avg:544.92ms
+step:305/500 train_time:165901ms step_avg:543.94ms
+step:306/500 train_time:166143ms step_avg:542.95ms
+step:307/500 train_time:166385ms step_avg:541.97ms
+step:308/500 train_time:166627ms step_avg:541.00ms
+step:309/500 train_time:166871ms step_avg:540.04ms
+step:310/500 train_time:167114ms step_avg:539.08ms
+step:311/500 train_time:167355ms step_avg:538.12ms
+step:312/500 train_time:167597ms step_avg:537.17ms
+step:313/500 train_time:167841ms step_avg:536.23ms
+step:314/500 train_time:168084ms step_avg:535.30ms
+step:315/500 train_time:168328ms step_avg:534.37ms
+step:316/500 train_time:168570ms step_avg:533.45ms
+step:317/500 train_time:168813ms step_avg:532.53ms
+step:318/500 train_time:169056ms step_avg:531.62ms
+step:319/500 train_time:169299ms step_avg:530.72ms
+step:320/500 train_time:169542ms step_avg:529.82ms
+step:321/500 train_time:169785ms step_avg:528.92ms
+step:322/500 train_time:170027ms step_avg:528.03ms
+step:323/500 train_time:170270ms step_avg:527.15ms
+step:324/500 train_time:170514ms step_avg:526.28ms
+step:325/500 train_time:170756ms step_avg:525.40ms
+step:326/500 train_time:170998ms step_avg:524.53ms
+step:327/500 train_time:171242ms step_avg:523.67ms
+step:328/500 train_time:171484ms step_avg:522.82ms
+step:329/500 train_time:171728ms step_avg:521.97ms
+step:330/500 train_time:171972ms step_avg:521.13ms
+step:331/500 train_time:172215ms step_avg:520.29ms
+step:332/500 train_time:172456ms step_avg:519.45ms
+step:333/500 train_time:172700ms step_avg:518.62ms
+step:334/500 train_time:172943ms step_avg:517.79ms
+step:335/500 train_time:173186ms step_avg:516.97ms
+step:336/500 train_time:173430ms step_avg:516.16ms
+step:337/500 train_time:173673ms step_avg:515.35ms
+step:338/500 train_time:173915ms step_avg:514.54ms
+step:339/500 train_time:174157ms step_avg:513.74ms
+step:340/500 train_time:174400ms step_avg:512.94ms
+step:341/500 train_time:174643ms step_avg:512.15ms
+step:342/500 train_time:174885ms step_avg:511.36ms
+step:343/500 train_time:175128ms step_avg:510.58ms
+step:344/500 train_time:175371ms step_avg:509.80ms
+step:345/500 train_time:175615ms step_avg:509.03ms
+step:346/500 train_time:175857ms step_avg:508.26ms
+step:347/500 train_time:176100ms step_avg:507.49ms
+step:348/500 train_time:176342ms step_avg:506.73ms
+step:349/500 train_time:176586ms step_avg:505.98ms
+step:350/500 train_time:176829ms step_avg:505.23ms
+step:351/500 train_time:177073ms step_avg:504.48ms
+step:352/500 train_time:177315ms step_avg:503.74ms
+step:353/500 train_time:177559ms step_avg:503.00ms
+step:354/500 train_time:177802ms step_avg:502.26ms
+step:355/500 train_time:178045ms step_avg:501.54ms
+step:356/500 train_time:178287ms step_avg:500.81ms
+step:357/500 train_time:178531ms step_avg:500.09ms
+step:358/500 train_time:178773ms step_avg:499.37ms
+step:359/500 train_time:179016ms step_avg:498.65ms
+step:360/500 train_time:179258ms step_avg:497.94ms
+step:361/500 train_time:179501ms step_avg:497.23ms
+step:362/500 train_time:179743ms step_avg:496.53ms
+step:363/500 train_time:179986ms step_avg:495.83ms
+step:364/500 train_time:180228ms step_avg:495.13ms
+step:365/500 train_time:180472ms step_avg:494.44ms
+step:366/500 train_time:180714ms step_avg:493.76ms
+step:367/500 train_time:180957ms step_avg:493.07ms
+step:368/500 train_time:181199ms step_avg:492.39ms
+step:369/500 train_time:181442ms step_avg:491.71ms
+step:370/500 train_time:181685ms step_avg:491.04ms
+step:371/500 train_time:181930ms step_avg:490.38ms
+step:372/500 train_time:182173ms step_avg:489.71ms
+step:373/500 train_time:182415ms step_avg:489.05ms
+step:374/500 train_time:182657ms step_avg:488.39ms
+step:375/500 train_time:182900ms step_avg:487.73ms
+step:376/500 train_time:183144ms step_avg:487.08ms
+step:377/500 train_time:183387ms step_avg:486.44ms
+step:378/500 train_time:183630ms step_avg:485.79ms
+step:379/500 train_time:183873ms step_avg:485.15ms
+step:380/500 train_time:184116ms step_avg:484.52ms
+step:381/500 train_time:184358ms step_avg:483.88ms
+step:382/500 train_time:184600ms step_avg:483.25ms
+step:383/500 train_time:184844ms step_avg:482.62ms
+step:384/500 train_time:185086ms step_avg:482.00ms
+step:385/500 train_time:185330ms step_avg:481.38ms
+step:386/500 train_time:185575ms step_avg:480.76ms
+step:387/500 train_time:185817ms step_avg:480.15ms
+step:388/500 train_time:186061ms step_avg:479.54ms
+step:389/500 train_time:186304ms step_avg:478.93ms
+step:390/500 train_time:186545ms step_avg:478.32ms
+step:391/500 train_time:186788ms step_avg:477.72ms
+step:392/500 train_time:187032ms step_avg:477.12ms
+step:393/500 train_time:187275ms step_avg:476.53ms
+step:394/500 train_time:187517ms step_avg:475.93ms
+step:395/500 train_time:187761ms step_avg:475.34ms
+step:396/500 train_time:188007ms step_avg:474.77ms
+step:397/500 train_time:188248ms step_avg:474.18ms
+step:398/500 train_time:188492ms step_avg:473.60ms
+step:399/500 train_time:188733ms step_avg:473.02ms
+step:400/500 train_time:188975ms step_avg:472.44ms
+step:400/500 val_loss:4.2565 train_time:189016ms step_avg:472.54ms
+step:401/500 train_time:189221ms step_avg:471.87ms
+step:402/500 train_time:189465ms step_avg:471.30ms
+step:403/500 train_time:189707ms step_avg:470.74ms
+step:404/500 train_time:189949ms step_avg:470.17ms
+step:405/500 train_time:190192ms step_avg:469.61ms
+step:406/500 train_time:190435ms step_avg:469.05ms
+step:407/500 train_time:190679ms step_avg:468.50ms
+step:408/500 train_time:190922ms step_avg:467.95ms
+step:409/500 train_time:191164ms step_avg:467.39ms
+step:410/500 train_time:191407ms step_avg:466.85ms
+step:411/500 train_time:191651ms step_avg:466.30ms
+step:412/500 train_time:191893ms step_avg:465.76ms
+step:413/500 train_time:192136ms step_avg:465.22ms
+step:414/500 train_time:192378ms step_avg:464.68ms
+step:415/500 train_time:192621ms step_avg:464.15ms
+step:416/500 train_time:192864ms step_avg:463.62ms
+step:417/500 train_time:193107ms step_avg:463.09ms
+step:418/500 train_time:193349ms step_avg:462.56ms
+step:419/500 train_time:193592ms step_avg:462.03ms
+step:420/500 train_time:193835ms step_avg:461.51ms
+step:421/500 train_time:194079ms step_avg:461.00ms
+step:422/500 train_time:194322ms step_avg:460.48ms
+step:423/500 train_time:194565ms step_avg:459.96ms
+step:424/500 train_time:194807ms step_avg:459.45ms
+step:425/500 train_time:195051ms step_avg:458.94ms
+step:426/500 train_time:195293ms step_avg:458.43ms
+step:427/500 train_time:195537ms step_avg:457.93ms
+step:428/500 train_time:195779ms step_avg:457.43ms
+step:429/500 train_time:196022ms step_avg:456.93ms
+step:430/500 train_time:196264ms step_avg:456.43ms
+step:431/500 train_time:196508ms step_avg:455.93ms
+step:432/500 train_time:196750ms step_avg:455.44ms
+step:433/500 train_time:196994ms step_avg:454.95ms
+step:434/500 train_time:197236ms step_avg:454.46ms
+step:435/500 train_time:197480ms step_avg:453.98ms
+step:436/500 train_time:197723ms step_avg:453.49ms
+step:437/500 train_time:197966ms step_avg:453.01ms
+step:438/500 train_time:198208ms step_avg:452.53ms
+step:439/500 train_time:198451ms step_avg:452.05ms
+step:440/500 train_time:198694ms step_avg:451.58ms
+step:441/500 train_time:198937ms step_avg:451.10ms
+step:442/500 train_time:199179ms step_avg:450.63ms
+step:443/500 train_time:199422ms step_avg:450.16ms
+step:444/500 train_time:199665ms step_avg:449.70ms
+step:445/500 train_time:199909ms step_avg:449.23ms
+step:446/500 train_time:200151ms step_avg:448.77ms
+step:447/500 train_time:200394ms step_avg:448.31ms
+step:448/500 train_time:200636ms step_avg:447.85ms
+step:449/500 train_time:200880ms step_avg:447.40ms
+step:450/500 train_time:201123ms step_avg:446.94ms
+step:451/500 train_time:201366ms step_avg:446.49ms
+step:452/500 train_time:201608ms step_avg:446.04ms
+step:453/500 train_time:201851ms step_avg:445.59ms
+step:454/500 train_time:202094ms step_avg:445.14ms
+step:455/500 train_time:202338ms step_avg:444.70ms
+step:456/500 train_time:202581ms step_avg:444.26ms
+step:457/500 train_time:202824ms step_avg:443.82ms
+step:458/500 train_time:203066ms step_avg:443.37ms
+step:459/500 train_time:276891ms step_avg:603.25ms
+step:460/500 train_time:277336ms step_avg:602.90ms
+step:461/500 train_time:277793ms step_avg:602.59ms
+step:462/500 train_time:278238ms step_avg:602.25ms
+step:463/500 train_time:278691ms step_avg:601.92ms
+step:464/500 train_time:279138ms step_avg:601.59ms
+step:465/500 train_time:279589ms step_avg:601.27ms
+step:466/500 train_time:280041ms step_avg:600.95ms
+step:467/500 train_time:280490ms step_avg:600.62ms
+step:468/500 train_time:280943ms step_avg:600.30ms
+step:469/500 train_time:281392ms step_avg:599.98ms
+step:470/500 train_time:281846ms step_avg:599.67ms
+step:471/500 train_time:282297ms step_avg:599.36ms
+step:472/500 train_time:282749ms step_avg:599.04ms
+step:473/500 train_time:283200ms step_avg:598.73ms
+step:474/500 train_time:283651ms step_avg:598.42ms
+step:475/500 train_time:284103ms step_avg:598.11ms
+step:476/500 train_time:284554ms step_avg:597.80ms
+step:477/500 train_time:285005ms step_avg:597.49ms
+step:478/500 train_time:285456ms step_avg:597.19ms
+step:479/500 train_time:285909ms step_avg:596.89ms
+step:480/500 train_time:286360ms step_avg:596.58ms
+step:481/500 train_time:286813ms step_avg:596.29ms
+step:482/500 train_time:287264ms step_avg:595.98ms
+step:483/500 train_time:287719ms step_avg:595.69ms
+step:484/500 train_time:288169ms step_avg:595.39ms
+step:485/500 train_time:288624ms step_avg:595.10ms
+step:486/500 train_time:289076ms step_avg:594.81ms
+step:487/500 train_time:289528ms step_avg:594.51ms
+step:488/500 train_time:289980ms step_avg:594.22ms
+step:489/500 train_time:290432ms step_avg:593.93ms
+step:490/500 train_time:290885ms step_avg:593.64ms
+step:491/500 train_time:291337ms step_avg:593.35ms
+step:492/500 train_time:291788ms step_avg:593.07ms
+step:493/500 train_time:292241ms step_avg:592.78ms
+step:494/500 train_time:292692ms step_avg:592.49ms
+step:495/500 train_time:293142ms step_avg:592.21ms
+step:496/500 train_time:293593ms step_avg:591.92ms
+step:497/500 train_time:294044ms step_avg:591.64ms
+step:498/500 train_time:294497ms step_avg:591.36ms
+step:499/500 train_time:294948ms step_avg:591.08ms
+step:500/500 train_time:295401ms step_avg:590.80ms
+step:500/500 val_loss:4.1742 train_time:295467ms step_avg:590.93ms
+peak memory allocated: 31408 MiB reserved: 39108 MiB

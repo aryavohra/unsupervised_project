@@ -1,0 +1,9 @@
+RUN_DIR=/root/modded-nanogpt/results/codex_xsa_no_gate_target328_20260526T015307Z
+CODE_DIR=/root/modded-nanogpt/results/codex_xsa_no_gate_target328_20260526T015307Z/code
+Tue May 26 01:53:07 UTC 2026
+torch 2.10.0+cu126 cuda 12.6 cuda_available True
+triton 3.6.0
+kernels /opt/conda/envs/nanogpt210/lib/python3.12/site-packages/kernels/__init__.py
+NVIDIA H100 80GB HBM3, 81559 MiB, 580.126.20
+===== RUN xsa record, sparse attention gate disabled =====
+RUN_DIR=/root/modded-nanogpt/results/codex_xsa_no_gate_target328_20260526T015307Z
