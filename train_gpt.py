@@ -691,26 +691,49 @@ class NorMuonAndAdam:
     def state_dict(self):
         """Return the optimizer state as a dict."""
         return {
-            "param_states": {id(p): s for p, s in self.param_states.items()},
-            "param_cfgs": {id(p): s for p, s in self.param_cfgs.items()},
+            "version": 2,
+            "split_embed": self.split_embed,
+            "param_states": {
+                self.param_cfgs[p].label: s
+                for p, s in self.param_states.items()
+            },
         }
 
     def load_state_dict(self, state_dict):
         """Load optimizer state from a dict."""
-        # Build id->param mapping
-        id_to_param = {id(p): p for p in self.param_cfgs}
+        saved_states = state_dict["param_states"]
+        label_to_param = {
+            p_cfg.label: param
+            for param, p_cfg in self.param_cfgs.items()
+        }
+
+        # Checkpoints written before optimizer-state version 2 used process-local
+        # id(param) keys. Those cannot be matched after a restart.
+        if saved_states and not all(isinstance(key, str) for key in saved_states):
+            raise ValueError(
+                "Checkpoint optimizer state uses legacy process-local parameter ids "
+                "and cannot be loaded safely after restart. Resume with model weights "
+                "only, or use a checkpoint written by the label-keyed checkpoint code."
+            )
 
         # Load state, preserving dtypes
-        for param_id, saved_p_state in state_dict["param_states"].items():
-            if param_id in id_to_param:
-                param = id_to_param[param_id]
-                p_state = self.param_states[param]
-                for k, v in saved_p_state.items():
-                    if isinstance(v, torch.Tensor) and k in p_state:
-                        target_dtype = p_state[k].dtype
-                        p_state[k] = v.to(dtype=target_dtype, device=p_state[k].device)
-                    else:
-                        p_state[k] = v
+        missing_labels = set(label_to_param) - set(saved_states)
+        unexpected_labels = set(saved_states) - set(label_to_param)
+        if missing_labels or unexpected_labels:
+            raise ValueError(
+                f"Optimizer checkpoint labels do not match model parameters: "
+                f"missing={sorted(missing_labels)}, unexpected={sorted(unexpected_labels)}"
+            )
+        for label, saved_p_state in saved_states.items():
+            param = label_to_param[label]
+            p_state = self.param_states[param]
+            for k, v in saved_p_state.items():
+                if isinstance(v, torch.Tensor) and k in p_state:
+                    target_dtype = p_state[k].dtype
+                    p_state[k] = v.to(dtype=target_dtype, device=p_state[k].device)
+                else:
+                    p_state[k] = v
+        self.split_embed = bool(state_dict.get("split_embed", False))
 
     # -----------------------------------
     # Unified optimizer step with explicit ordering
@@ -2659,19 +2682,32 @@ class TrainingManager():
         if step == self.split_step:
             self.optimizer.copy_lm_state_to_embed()
 
-    def reset(self, state=None):
-        if state is not None:
-            self.optimizer.load_state_dict(state)
-
-        # Reset NorMuon momentum buffers and split_embed state
-        self.optimizer.reset()
+    def reset_schedule(self, step: int = 0):
+        if step < 0:
+            raise ValueError(f"Schedule step must be nonnegative, got {step}")
 
         stage, _ = training_schedule.lookup(0)
         self.ws_short, self.ws_long = stage.window_sizes
         self.batch_size = stage.batch_size
         self.train_max_seq_len = stage.train_max_seq_len
+        self.train_loader_send_args = None
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
+
+        schedule_step = min(step, training_schedule.total_steps)
+        for transition_step in self.get_transition_steps():
+            if transition_step <= schedule_step:
+                self.advance_schedule(transition_step)
+        self.advance_schedule(schedule_step)
+
+    def reset(self, state=None, schedule_step: int = 0):
+        if state is not None:
+            self.optimizer.load_state_dict(state)
+        else:
+            self.optimizer.reset()
+            self.optimizer.split_embed = schedule_step > self.split_step
+
+        self.reset_schedule(schedule_step)
         if _sparse_comms_active():
             self.row_update_mask = np.zeros(args.bigram_vocab_size, dtype=np.uint8)
             self.sparse_counts_state = None
@@ -2808,9 +2844,39 @@ if args.xsa_interp:
 else:
     model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
-if args.load_optimizer and loaded_checkpoint is not None and isinstance(loaded_checkpoint, dict) and "optimizer" in loaded_checkpoint:
-    print0("Loading optimizer state from checkpoint", console=True)
-    training_manager.reset(loaded_checkpoint["optimizer"])
+
+def _rank_optimizer_checkpoint_path(model_checkpoint_path: str, rank: int):
+    root, ext = os.path.splitext(model_checkpoint_path)
+    return f"{root}.rank{rank:05d}.optim{ext or '.pt'}"
+
+
+loaded_optimizer_state = None
+if args.load_optimizer and loaded_checkpoint is not None and isinstance(loaded_checkpoint, dict):
+    rank_optimizer_path = _rank_optimizer_checkpoint_path(args.load_checkpoint, rank)
+    if os.path.exists(rank_optimizer_path):
+        print0(f"Loading rank-local optimizer state from {rank_optimizer_path}", console=True)
+        loaded_optimizer_state = torch.load(rank_optimizer_path, map_location="cpu", weights_only=False)
+        checkpoint_world_size = int(loaded_optimizer_state.get("world_size", world_size))
+        if checkpoint_world_size != world_size:
+            raise ValueError(
+                f"Optimizer checkpoint world_size={checkpoint_world_size} does not match current world_size={world_size}"
+            )
+        loaded_optimizer_state = loaded_optimizer_state["optimizer"]
+    elif "optimizer" in loaded_checkpoint:
+        print0("Loading optimizer state embedded in checkpoint", console=True)
+        loaded_optimizer_state = loaded_checkpoint["optimizer"]
+    else:
+        raise FileNotFoundError(
+            f"--load-optimizer was requested, but no optimizer state was found. "
+            f"Expected rank-local optimizer checkpoint at {rank_optimizer_path}"
+        )
+if loaded_optimizer_state is not None:
+    training_manager.reset(
+        loaded_optimizer_state,
+        schedule_step=loaded_checkpoint_step if loaded_checkpoint_step is not None else 0,
+    )
+elif loaded_checkpoint_step is not None:
+    training_manager.reset(schedule_step=loaded_checkpoint_step)
 if loaded_checkpoint is not None:
     del loaded_checkpoint
     gc.collect()
@@ -3054,7 +3120,21 @@ train_steps = training_schedule.total_steps
 if args.max_train_steps is not None:
     train_steps = min(train_steps, args.max_train_steps)
     print0(f"Capping training loop at {train_steps} optimizer steps", console=True)
-for step in range(train_steps + 1):
+resume_step = loaded_checkpoint_step if loaded_checkpoint_step is not None else 0
+if resume_step > train_steps:
+    raise ValueError(f"Loaded checkpoint step {resume_step} is beyond requested train_steps={train_steps}")
+if resume_step:
+    print0(f"Resuming training from checkpoint step {resume_step}", console=True)
+    print0(f"Fast-forwarding training data stream through {resume_step} completed step(s)", console=True)
+    for skipped_step in range(resume_step):
+        training_manager.advance_schedule(skipped_step)
+        for _ in range(grad_accum_steps):
+            next_args = training_manager.train_loader_send_args
+            next(train_loader) if next_args is None else train_loader.send(next_args)
+    training_manager.advance_schedule(resume_step)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+for step in range(resume_step, train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
@@ -3076,18 +3156,39 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        completed_since_start = max(step - resume_step, 1)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/completed_since_start:.2f}ms", console=True)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
     if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
+        if args.save_checkpoint:
             checkpoint_dir = os.path.join(args.checkpoint_dir, run_id)
             os.makedirs(checkpoint_dir, exist_ok=True)
-            torch.save(log, os.path.join(checkpoint_dir, f"state_step{step:06d}.pt"))
+            checkpoint_path = os.path.join(checkpoint_dir, f"state_step{step:06d}.pt")
+            optimizer_log = dict(
+                step=step,
+                world_size=world_size,
+                rank=rank,
+                optimizer=training_manager.get_state(),
+            )
+            torch.save(optimizer_log, _rank_optimizer_checkpoint_path(checkpoint_path, rank))
+            if master_process:
+                log = dict(
+                    step=step,
+                    code=code,
+                    model=model.state_dict(),
+                    optimizer_checkpoint_format="rank-local-v2",
+                    optimizer_world_size=world_size,
+                    optimizer_path_pattern=f"state_step{step:06d}.rank{{rank:05d}}.optim.pt",
+                )
+                if world_size == 1:
+                    log["optimizer"] = optimizer_log["optimizer"]
+                torch.save(log, checkpoint_path)
+            if dist.is_initialized():
+                dist.barrier()
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -3103,7 +3204,8 @@ for step in range(train_steps + 1):
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    completed_since_start = step + 1 - resume_step
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/completed_since_start:.2f}ms", console=True)
 
 if args.run_evals:
     model.eval()
