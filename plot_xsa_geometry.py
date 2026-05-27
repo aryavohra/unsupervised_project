@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
 import numpy as np
 
 
@@ -22,6 +23,17 @@ SERIES_COLORS = {
     "XSA off": "#d95f02",
     "XSA on": "#0571b0",
 }
+DENSEVAL_LOG_DIR = Path("novita_denseval_20260526_logs")
+DENSEVAL_GATE_OFF_FIXEDCODE = (
+    DENSEVAL_LOG_DIR / "record-xsa-gate-off-1400-denseval-stop328-fixedcode-20260526.txt"
+)
+DENSEVAL_GATE_ON = DENSEVAL_LOG_DIR / "record-xsa-gate-on-1400-denseval-stop328-20260526.txt"
+VAL_LOSS_RE = re.compile(
+    r"step:(?P<step>\d+)/(?P<total>\d+)\s+"
+    r"val_loss:(?P<val_loss>[0-9.]+)\s+"
+    r"train_time:(?P<train_time_ms>\d+)ms\s+"
+    r"step_avg:(?P<step_avg_ms>[0-9.]+)ms"
+)
 
 
 def _as_mode_slice(values: np.ndarray, mode_index: int, mode_count: int | None) -> np.ndarray:
@@ -426,6 +438,109 @@ def plot_validation_value_alignment(
             summary[f"{label_key}_{space}_peak_alignment"] = float(np.nanmax(means))
     return outputs, summary
 
+def _parse_val_loss_log(log_path: Path) -> np.ndarray:
+    rows = []
+    for match in VAL_LOSS_RE.finditer(log_path.read_text(errors="ignore")):
+        rows.append(
+            (
+                int(match.group("step")),
+                int(match.group("total")),
+                float(match.group("val_loss")),
+                int(match.group("train_time_ms")) / 1000.0,
+                float(match.group("step_avg_ms")),
+            )
+        )
+    if not rows:
+        raise ValueError(f"No validation loss rows found in {log_path}")
+    return np.array(
+        rows,
+        dtype=[
+            ("step", "i4"),
+            ("total", "i4"),
+            ("val_loss", "f8"),
+            ("train_time_s", "f8"),
+            ("step_avg_ms", "f8"),
+        ],
+    )
+
+
+def _save_denseval_loss_over_time(
+    gate_off_log: Path,
+    gate_on_log: Path,
+    output_path: Path,
+) -> Path:
+    gate_off = _parse_val_loss_log(gate_off_log)
+    gate_on = _parse_val_loss_log(gate_on_log)
+    gate_off = gate_off[gate_off["step"] > 0]
+    gate_on = gate_on[gate_on["step"] > 0]
+
+    gate_off_min = gate_off["train_time_s"] / 60.0
+    gate_on_min = gate_on["train_time_s"] / 60.0
+    late_step = 1370
+    gate_off_late = gate_off[gate_off["step"] >= late_step]
+    gate_on_late = gate_on[gate_on["step"] >= late_step]
+    gate_off_late_min = gate_off_late["train_time_s"] / 60.0
+    gate_on_late_min = gate_on_late["train_time_s"] / 60.0
+
+    fig, (ax_full, ax_late) = plt.subplots(1, 2, figsize=(10, 4.5), constrained_layout=True)
+
+    ax_full.plot(
+        gate_off_min,
+        gate_off["val_loss"],
+        marker="o",
+        markersize=4,
+        color="#0571b0",
+        label="XSA gate off",
+    )
+    ax_full.plot(
+        gate_on_min,
+        gate_on["val_loss"],
+        marker="o",
+        markersize=4,
+        color="#ca0020",
+        label="XSA gate on",
+    )
+    ax_full.axhline(3.28, color="black", lw=1.0, ls="--", alpha=0.45)
+    ax_full.set_title("XSA with/without Sparse Attention Gate Ablation", fontsize=12, weight="bold")
+    ax_full.set_xlabel("training time (min, log scale)")
+    ax_full.set_ylabel("validation loss")
+    ax_full.set_xscale("log")
+    log_ticks = [0.5, 1.0, 2.0, 5.0, 10.0]
+    ax_full.xaxis.set_major_locator(FixedLocator(log_ticks))
+    ax_full.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:g}"))
+    ax_full.xaxis.set_minor_formatter(NullFormatter())
+    ax_full.grid(True, alpha=0.25)
+    ax_full.grid(True, which="minor", alpha=0.12)
+    ax_full.legend(frameon=False)
+
+    ax_late.plot(
+        gate_off_late_min,
+        gate_off_late["val_loss"],
+        marker="o",
+        markersize=4,
+        color="#0571b0",
+        label="XSA gate off",
+    )
+    ax_late.plot(
+        gate_on_late_min,
+        gate_on_late["val_loss"],
+        marker="o",
+        markersize=4,
+        color="#ca0020",
+        label="XSA gate on",
+    )
+    ax_late.axhline(3.28, color="black", lw=1.0, ls="--", alpha=0.45)
+    ax_late.set_title(f"Late window, step {late_step}+", fontsize=12, weight="bold")
+    ax_late.set_xlabel("training time (min)")
+    ax_late.set_ylabel("validation loss")
+    late_losses = np.concatenate([gate_off_late["val_loss"], gate_on_late["val_loss"]])
+    ax_late.set_ylim(late_losses.min() - 0.00035, late_losses.max() + 0.00035)
+    ax_late.grid(True, alpha=0.25)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return output_path
+
 
 def plot_xsa_geometry(npz_path: Path, output_dir: Path, mode_index: int = 0) -> tuple[list[Path], dict[str, float]]:
     data = np.load(npz_path)
@@ -473,6 +588,7 @@ def plot_xsa_geometry(npz_path: Path, output_dir: Path, mode_index: int = 0) -> 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("npz", type=Path, nargs="+", help="Path(s) to XSA geometry or validation-alignment npz artifacts.")
+    parser.add_argument("npz", type=Path, nargs="?", help="Path to an *_xsa_geometry.npz artifact.")
     parser.add_argument(
         "-o",
         "--output",
@@ -495,6 +611,29 @@ def parse_args() -> argparse.Namespace:
         default="validation_value_alignment",
         help="Output filename stem for --validation-series plots.",
     )
+    parser.add_argument(
+        "--plot-denseval",
+        action="store_true",
+        help="Plot dense validation loss over time for the Novita gate-off/gate-on logs.",
+    )
+    parser.add_argument(
+        "--denseval-gate-off-log",
+        type=Path,
+        default=DENSEVAL_GATE_OFF_FIXEDCODE,
+        help="Denseval log for the XSA gate-off fixedcode run.",
+    )
+    parser.add_argument(
+        "--denseval-gate-on-log",
+        type=Path,
+        default=DENSEVAL_GATE_ON,
+        help="Denseval log for the XSA gate-on run.",
+    )
+    parser.add_argument(
+        "--denseval-output",
+        type=Path,
+        default=DENSEVAL_LOG_DIR / "xsa_gate_denseval_loss_over_time.png",
+        help="Output path for the denseval loss-over-time plot.",
+    )
     return parser.parse_args()
 
 
@@ -514,6 +653,19 @@ def main() -> None:
     print("summary:")
     for key, value in summary.items():
         print(f"  {key}: {value:.6f}")
+    if args.plot_denseval:
+        print(_save_denseval_loss_over_time(args.denseval_gate_off_log, args.denseval_gate_on_log, args.denseval_output))
+
+    if args.npz is not None:
+        output_dir = args.output or args.npz.with_name(f"{args.npz.stem}_plots")
+        outputs, summary = plot_xsa_geometry(args.npz, output_dir, mode_index=args.mode_index)
+        for output in outputs:
+            print(output)
+        print("summary:")
+        for key, value in summary.items():
+            print(f"  {key}: {value:.6f}")
+    elif not args.plot_denseval:
+        raise SystemExit("Provide an NPZ artifact or pass --plot-denseval.")
 
 
 if __name__ == "__main__":
