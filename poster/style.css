@@ -373,6 +373,39 @@ li strong {
   text-align: center;
 }
 
+.plot-row {
+  display: flex;
+  gap: 3mm;
+  justify-content: center;
+  align-items: flex-start;
+  margin: 2mm 0;
+}
+
+.compact-plot-row .plot-container {
+  flex: 0 1 50%;
+  padding: 2mm;
+  margin: 0;
+}
+
+.plot-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 3mm;
+  margin: 2mm 0;
+}
+
+.plot-stack .plot-container {
+  width: 100%;
+  margin: 0;
+}
+
+.poster-plot {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+
 /* Tables */
 table {
   width: 100%;

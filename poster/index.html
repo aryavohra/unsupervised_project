@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Exploration of Exclusive Self Attention</title>
+  <title>Understanding and Extending Exclusive Self Attention</title>
   <link rel="stylesheet" href="style.css">
   
   <!-- MathJax Configuration & Loader -->
@@ -44,7 +44,7 @@
       <!-- HEADER -->
       <header>
         <div class="header-main">
-          <h1 class="poster-title">Exploration of <span>Exclusive Self Attention</span></h1>
+          <h1 class="poster-title">Understanding and Extending <span>Exclusive Self Attention</span></h1>
         </div>
         <div class="header-meta">
           <p class="authors">Arya Vohra &amp; Aleksandr Popov</p>
@@ -89,8 +89,14 @@
               <li>We observe consistent, strong $v_i$-alignment across heads and layers, demonstrating that standard attention wastes capacity on self-token information.</li>
             </ul>
             
-            <!-- Heatmap Plot - Colored Box Div -->
-            <div style="height: 160px; background: linear-gradient(135deg, var(--primary) 0%, var(--accent-purple) 100%); border-radius: 12px; box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.08); border: 1px solid var(--border-color); margin: 3mm 0;"></div>
+            <div class="plot-row compact-plot-row">
+              <div class="plot-container">
+                <img class="poster-plot" src="../xsa_interp_visuals/poster_alignment/xsa_on_off_all_spaces_alignment_xsa_off_value_over_steps.png" alt="XSA off value alignment over training steps">
+              </div>
+              <div class="plot-container">
+                <img class="poster-plot" src="../xsa_interp_visuals/poster_alignment/xsa_on_off_all_spaces_alignment_xsa_off_value_by_unpaired_layer.png" alt="XSA off value alignment by unpaired layer">
+              </div>
+            </div>
           </section>
 
           <!-- TRAINING AN XSA MODEL & VARIANTS -->
@@ -143,15 +149,15 @@
                 </tr>
                 <tr>
                   <td><strong>Residual Space XSA</strong></td>
-                  <td>3.291</td>
-                  <td>1980 steps</td>
-                  <td>12.6 ms (0.98x)</td>
+                  <td>?</td>
+                  <td>?</td>
+                  <td>?</td>
                 </tr>
                 <tr>
                   <td><strong>Model Space XSA</strong></td>
-                  <td>3.278</td>
-                  <td>1890 steps</td>
-                  <td>13.9 ms (0.89x)</td>
+                  <td>?</td>
+                  <td>?</td>
+                  <td>?</td>
                 </tr>
               </tbody>
             </table>
@@ -170,6 +176,15 @@
             <ul>
               <li><strong>Sinking Hypothesis:</strong> Does the model learn that self-attention components are actively discarded? We observed that XSA models allocate significantly <em>higher</em> attention mass towards the self-token, validating that it acts as an implicit, low-overhead sink.</li>
             </ul>
+
+            <div class="plot-stack">
+              <div class="plot-container">
+                <img class="poster-plot" src="../xsa_interp_visuals/poster_alignment/xsa_on_off_all_spaces_alignment_over_steps.png" alt="XSA on and off alignment over training steps">
+              </div>
+              <div class="plot-container">
+                <img class="poster-plot" src="../xsa_interp_visuals/poster_alignment/xsa_on_off_all_spaces_alignment_by_unpaired_layer.png" alt="XSA on and off alignment by unpaired layer">
+              </div>
+            </div>
             
             <table>
               <thead>
@@ -250,8 +265,11 @@
               <li>Removing these gates and replacing them with XSA resulted in a cleaner architecture that achieves the validation loss target faster.</li>
             </ul>
             
-            <!-- Validation Loss Speedrun Plot - Colored Box Div -->
-            <div style="height: 160px; background: linear-gradient(135deg, var(--accent-teal) 0%, var(--primary) 100%); border-radius: 12px; box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.08); border: 1px solid var(--border-color); margin: 3mm 0;"></div>
+            <div class="plot-stack">
+              <div class="plot-container">
+                <img class="poster-plot" src="../xsa_interp_visuals/poster_alignment/xsa_gate_denseval_loss_over_time.png" alt="XSA gate dense validation loss over training time">
+              </div>
+            </div>
           </section>
 
           <!-- CONCLUSION -->
@@ -259,7 +277,7 @@
             <h2 class="section-title">Conclusions &amp; Future Work</h2>
             <ul>
               <li>
-                <strong>Valuable Inductive Bias:</strong> Confirms the foundational intuition of self-attention as a purely <em>contextual mixing operator</em>. Forcing attention outputs to be orthogonal to the self-value improves general learning efficiency.
+                <strong>Valuable Inductive Bias:</strong> Confirms the foundational intuition of self-attention as largely a <em>contextual mixing operator</em>. Forcing attention outputs to be orthogonal to the self-value improves general learning efficiency.
               </li>
               <li>
                 <strong>Implicit Sinks Work:</strong> Confirms that XSA provides a robust, zero-parameter alternative to explicit attention sinks, naturally absorbing redundant attention mass on diagonal indices.
