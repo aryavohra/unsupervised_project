@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exploration of Exclusive Self Attention</title>
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- MathJax Configuration & Loader -->
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        processEscapes: true
+      },
+      options: {
+        ignoreHtmlClass: 'tex2jax_ignore',
+        processHtmlClass: 'tex2jax_process'
+      }
+    };
+  </script>
+  <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+  <!-- Floating UI Zoom Controls (no-print) -->
+  <div class="controls-panel no-print">
+    <span>Zoom:</span>
+    <button onclick="zoomOut()">−</button>
+    <span class="zoom-val" id="zoom-text">45%</span>
+    <button onclick="zoomIn()">+</button>
+    <button onclick="resetZoom()">Fit</button>
+    <button onclick="window.print()" style="background: var(--accent-purple);">Print A1</button>
+  </div>
+
+  <!-- Poster Wrapper (for scaling) -->
+  <div class="poster-wrapper" id="poster-scale-wrapper">
+    
+    <!-- Main Poster Container -->
+    <div class="poster">
+      
+      <!-- HEADER -->
+      <header>
+        <div class="header-main">
+          <h1 class="poster-title">Exploration of <span>Exclusive Self Attention</span></h1>
+        </div>
+        <div class="header-meta">
+          <p class="authors">Arya Vohra &amp; Aleksandr Popov</p>
+        </div>
+      </header>
+
+      <!-- TWO-COLUMN BODY -->
+      <div class="poster-body">
+        
+        <!-- LEFT COLUMN -->
+        <div class="column">
+          
+          <!-- INTRODUCTION -->
+          <section>
+            <h2 class="section-title">Introduction &amp; Background</h2>
+            <ul>
+              <li><strong>Exclusive Self Attention (XSA)</strong> (<a href="#ref-zhai">Zhai et al., 2026</a>) is a novel modification to the self-attention operation in transformer-based LLMs. For each attention head, it orthogonalizes the attention outputs relative to the current token's value vector, removing the component along the self-value direction.</li>
+              <li>For head $h$ at position $i$, standard attention is modified by XSA to project the attention output $y_{h,i}$ onto the orthogonal complement of the self-value vector $v_{h,i}$:</li>
+            </ul>
+            <div class="equation-block" style="display: flex; justify-content: space-around; align-items: center; width: 100%; gap: 15px; flex-wrap: wrap; text-align: center; padding: 6mm 4mm;">
+              <div style="flex: 1; min-width: 200px;">
+                <span style="font-size: 14pt; font-weight: 700; color: var(--primary); display: block; margin-bottom: 2mm; font-family: 'Outfit';">Standard Attention</span>
+                $\displaystyle y_{h,i}=\sum_{j\leq i} a_{h,ij}v_{h,j}$
+              </div>
+              <div style="border-left: 2px solid var(--border-color); height: 16mm; margin: 0 4mm;" class="no-print"></div>
+              <div style="flex: 1; min-width: 280px;">
+                <span style="font-size: 14pt; font-weight: 700; color: var(--accent-purple); display: block; margin-bottom: 2mm; font-family: 'Outfit';">Exclusive Self Attention (XSA)</span>
+                $\displaystyle z_{h,i} = \left( I - \frac{v_{h,i}v_{h,i}^{\top}}{\|v_{h,i}\|^2} \right) y_{h,i}$
+              </div>
+            </div>
+            <ul>
+              <li><strong>Core Intuition:</strong> Attention should prioritize modeling <em>contextual information</em> from other tokens, since information about the current token is already natively preserved through the residual stream and subsequent feedforward networks (FFN).</li>
+              <li>XSA also acts as an <strong>implicit attention sink</strong>. By removing the attention component along $v_i$, models can discard attention mass by attending heavily to the self-value, allowing tokens to "attend to nothing" without requiring an explicit sink token.</li>
+            </ul>
+          </section>
+
+          <!-- EXISTENCE OF THE PHENOMENON -->
+          <section>
+            <h2 class="section-title">Existence of the Phenomenon</h2>
+            <ul>
+              <li>To confirm the underlying premise of XSA, we trained an 11-layer GPT-2-style model on FineWeb and analyzed the alignment between attention outputs $y_i$ and self-values $v_i$.</li>
+              <li>We observe consistent, strong $v_i$-alignment across heads and layers, demonstrating that standard attention wastes capacity on self-token information.</li>
+            </ul>
+            
+            <!-- Heatmap Plot - Colored Box Div -->
+            <div style="height: 160px; background: linear-gradient(135deg, var(--primary) 0%, var(--accent-purple) 100%); border-radius: 12px; box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.08); border: 1px solid var(--border-color); margin: 3mm 0;"></div>
+          </section>
+
+          <!-- TRAINING AN XSA MODEL & VARIANTS -->
+          <section>
+            <h2 class="section-title">Training an XSA Model</h2>
+            <ul>
+              <li>We explored three distinct structural variations of implementing the XSA orthogonalization principle across different spaces of the Transformer:</li>
+            </ul>
+            
+            <ul>
+              <li>
+                <strong>Value Space (Standard):</strong> Projects $y_{h,i}$ against $v_{h,i}$ on a per-head basis. It is the default implementation, performing well but suffering from slight orthogonalization overhead.
+              </li>
+              <li>
+                <strong>Residual Space:</strong> Projects the post-$W_o$ final attention output $o_i$ directly against the residual token representation $x_i$:
+                <div class="equation-block">
+                  $$o_i'= o_i-\frac{o_i^\top x_i}{\|x_i\|^2}x_i$$
+                </div>
+              </li>
+              <li>
+                <strong>Model Space (Diag):</strong> Projects $o_i$ against the combined subspace span of all head self-values in the model space. Let $u_{h,i}=W_o^{(h)}v_{h,i}$, $U_i=\operatorname{orth}(u_{1,i},\ldots,u_{H,i})$, and:
+                <div class="equation-block">
+                  $$o_i'=(I- U_iU_i^\top)o_i$$
+                </div>
+              </li>
+            </ul>
+
+            <p><strong>Training Efficiency &amp; Performance:</strong></p>
+            <table>
+              <thead>
+                <tr>
+                  <th>Method Variant</th>
+                  <th>Val Loss (2k steps)</th>
+                  <th>Steps to 3.28</th>
+                  <th>Speed / Step</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Baseline NanoGPT</strong></td>
+                  <td>3.321</td>
+                  <td>N/A (stuck)</td>
+                  <td>12.4 ms (1.00x)</td>
+                </tr>
+                <tr style="background-color: var(--accent-purple-bg);">
+                  <td><strong>Value Space XSA</strong></td>
+                  <td><strong>3.272</strong></td>
+                  <td><strong>1820 steps</strong></td>
+                  <td>13.1 ms (0.95x)</td>
+                </tr>
+                <tr>
+                  <td><strong>Residual Space XSA</strong></td>
+                  <td>3.291</td>
+                  <td>1980 steps</td>
+                  <td>12.6 ms (0.98x)</td>
+                </tr>
+                <tr>
+                  <td><strong>Model Space XSA</strong></td>
+                  <td>3.278</td>
+                  <td>1890 steps</td>
+                  <td>13.9 ms (0.89x)</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+        </div>
+        
+        <!-- RIGHT COLUMN -->
+        <div class="column">
+          
+
+
+          <!-- MECHANISTIC INTERPRETABILITY (INTERP) -->
+          <section>
+            <h2 class="section-title">Mechanistic Interpretability &amp; Interventions</h2>
+            <ul>
+              <li><strong>Sinking Hypothesis:</strong> Does the model learn that self-attention components are actively discarded? We observed that XSA models allocate significantly <em>higher</em> attention mass towards the self-token, validating that it acts as an implicit, low-overhead sink.</li>
+            </ul>
+            
+            <table>
+              <thead>
+                <tr>
+                  <th>Model Setup</th>
+                  <th>Self-Attn $a_{ii}$ (Sink)</th>
+                  <th>$y_{\text{ctx}}$ Self-Aligned Prop.</th>
+                  <th>Interpretation</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Standard (No XSA)</strong></td>
+                  <td>Low (&lt; 0.08)</td>
+                  <td>Low</td>
+                  <td>Wastes context capacity on self-token</td>
+                </tr>
+                <tr style="background-color: var(--accent-teal-bg);">
+                  <td><strong>XSA (Ours)</strong></td>
+                  <td><strong>High (&gt; 0.42)</strong></td>
+                  <td><strong>High</strong></td>
+                  <td>Discards attention mass cleanly via projection</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <ul>
+              <li><strong>Causal Interventions:</strong> We took a fully-trained XSA model and dynamically perturbed or disabled the XSA projections at evaluation time to evaluate the causal role of the projection mechanisms.</li>
+            </ul>
+            
+            <table>
+              <thead>
+                <tr>
+                  <th>Eval-Time Intervention Description</th>
+                  <th style="text-align: right;">Overall \(\Delta \ell\)</th>
+                  <th>Mechanistic Interpretation</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>no_xsa_all</code> (Disable XSA globally)</td>
+                  <td style="text-align: right;"><span class="badge negative">-1.6383</span></td>
+                  <td>XSA performs a vital, pervasive causal role.</td>
+                </tr>
+                <tr>
+                  <td><code>shuffle_proj_g1_Lall</code> (Shuffle value projection)</td>
+                  <td style="text-align: right;"><span class="badge negative">-0.9055</span></td>
+                  <td>Removing arbitrary projection dimensions is highly damaging.</td>
+                </tr>
+                <tr>
+                  <td><code>force_diag_c0_Lall</code> (Zero out diagonal mass)</td>
+                  <td style="text-align: right;"><span class="badge negative">-0.3693</span></td>
+                  <td>Eliminating diagonal attention mass globally degrades loss.</td>
+                </tr>
+                <tr>
+                  <td><code>context_addback_e1_Lall</code> (Inject $v_i$ context)</td>
+                  <td style="text-align: right;"><span class="badge negative">-0.9854</span></td>
+                  <td>Adding back context-derived $v_i$-parallel components hurts.</td>
+                </tr>
+                <tr>
+                  <td><code>diag_addback_e0p5_Lall</code> (Add 50% diag value)</td>
+                  <td style="text-align: right;"><span class="badge minor">-0.1069</span></td>
+                  <td>Adding back minor diagonal value mass is tolerated.</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <!-- IMPROVING XSA IN NANOGPT SPEEDRUN -->
+          <section>
+            <h2 class="section-title">Improving XSA in NanoGPT Speedrun</h2>
+            <ul>
+              <li>The record Modded NanoGPT implementation contains a quasi-attention sink called "Sparse Attention Gates".</li>
+              <li>Since we demonstrated that XSA naturally behaves as a robust attention sink, we hypothesized that the Sparse Attention Gates would become completely redundant.</li>
+              <li>Removing these gates and replacing them with XSA resulted in a cleaner architecture that achieves the validation loss target faster.</li>
+            </ul>
+            
+            <!-- Validation Loss Speedrun Plot - Colored Box Div -->
+            <div style="height: 160px; background: linear-gradient(135deg, var(--accent-teal) 0%, var(--primary) 100%); border-radius: 12px; box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.08); border: 1px solid var(--border-color); margin: 3mm 0;"></div>
+          </section>
+
+          <!-- CONCLUSION -->
+          <section>
+            <h2 class="section-title">Conclusions &amp; Future Work</h2>
+            <ul>
+              <li>
+                <strong>Valuable Inductive Bias:</strong> Confirms the foundational intuition of self-attention as a purely <em>contextual mixing operator</em>. Forcing attention outputs to be orthogonal to the self-value improves general learning efficiency.
+              </li>
+              <li>
+                <strong>Implicit Sinks Work:</strong> Confirms that XSA provides a robust, zero-parameter alternative to explicit attention sinks, naturally absorbing redundant attention mass on diagonal indices.
+              </li>
+              <li>
+                <strong>Nuanced Scaling Required:</strong> XSA is not a blind drop-in. Layer-selective gating (e.g., lower strengths in initial layers) is key to optimal convergence in deeply stacked architectures.
+              </li>
+            </ul>
+          </section>
+
+        </div>
+
+      </div>
+
+      <!-- FOOTER -->
+      <footer>
+        <div class="footer-refs">
+          <h4>References</h4>
+          <ul>
+            <li id="ref-zhai">Zhai et al. (2026). "Exclusive Self Attention." <em>arXiv:2601.04932</em>.</li>
+            <li>Modded NanoGPT Speedrun (2024). GitHub Repository: <code>https://github.com/karpathy/llm.c</code></li>
+          </ul>
+        </div>
+      </footer>
+
+    </div>
+
+  </div>
+
+  <!-- Zoom Interface JS -->
+  <script>
+    let zoomLevel = 45;
+    const minZoom = 20;
+    const maxZoom = 150;
+    const wrapper = document.getElementById('poster-scale-wrapper');
+    const zoomText = document.getElementById('zoom-text');
+
+    function applyZoom() {
+      wrapper.style.transform = `scale(${zoomLevel / 100})`;
+      zoomText.textContent = `${zoomLevel}%`;
+    }
+
+    function zoomIn() {
+      if (zoomLevel + 5 <= maxZoom) {
+        zoomLevel += 5;
+        applyZoom();
+      }
+    }
+
+    function zoomOut() {
+      if (zoomLevel - 5 >= minZoom) {
+        zoomLevel -= 5;
+        applyZoom();
+      }
+    }
+
+    function resetZoom() {
+      const params = new URLSearchParams(window.location.search);
+      
+      // Check if screenshot mode is active
+      if (params.get('screenshot') === 'true') {
+        document.documentElement.classList.add('screenshot-mode');
+        document.body.classList.add('screenshot-mode');
+        zoomLevel = 100;
+        applyZoom();
+        return;
+      }
+      
+      // Check if scale override is present
+      const scaleOverride = params.get('scale');
+      if (scaleOverride) {
+        zoomLevel = parseInt(scaleOverride, 10);
+        applyZoom();
+        return;
+      }
+      
+      // Calculate fit zoom level based on screen width
+      const screenWidth = window.innerWidth;
+      const posterWidthPx = 594 * 3.7795275591; // Convert 594mm to approximate px at 96dpi (~2245px)
+      const idealZoom = Math.floor((screenWidth / posterWidthPx) * 90);
+      zoomLevel = Math.max(minZoom, Math.min(maxZoom, idealZoom));
+      applyZoom();
+    }
+
+
+
+    // Initial scale on load
+    window.addEventListener('load', () => {
+      resetZoom();
+    });
+    
+    // Recalculate zoom when window resizes
+    window.addEventListener('resize', () => {
+      resetZoom();
+    });
+  </script>
+</body>
+</html>
