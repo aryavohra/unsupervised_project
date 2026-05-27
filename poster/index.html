@@ -190,15 +190,23 @@
                 <col class="sink-col">
                 <col class="align-col">
                 <col class="align-col">
+                <col class="align-col">
+                <col class="align-col">
                 <col class="interp-col">
               </colgroup>
               <thead>
                 <tr>
-                  <th>Model</th>
-                  <th>Self-Attn $a_{ii}$</th>
-                  <th>$y_{\text{diag}}$ aligned frac.</th>
-                  <th>$y_{\text{ctx}}$ aligned frac.</th>
-                  <th>Observation</th>
+                  <th rowspan="2">Model</th>
+                  <th colspan="3">Normal attention</th>
+                  <th colspan="2">Force \(a_{ii}=0\)</th>
+                  <th rowspan="2">Observation</th>
+                </tr>
+                <tr>
+                  <th>Self-attn mass</th>
+                  <th>Self-token aligned frac.</th>
+                  <th>Context aligned frac.</th>
+                  <th>Context-only aligned frac.</th>
+                  <th>After XSA projection</th>
                 </tr>
               </thead>
               <tbody>
@@ -207,13 +215,17 @@
                   <td>0.0589</td>
                   <td>0.0460</td>
                   <td>0.1302</td>
-                  <td rowspan="2">XSA has much higher alignment with both self-token + self-aligned context (which are then both projected out)</td>
+                  <td>0.1504</td>
+                  <td>0.1504</td>
+                  <td rowspan="2">XSA increases explicit self-attention and context-only self-alignment; the learned projection removes most of that context-aligned component.</td>
                 </tr>
                 <tr style="background-color: var(--accent-teal-bg);">
                   <td><strong>XSA</strong></td>
                   <td>0.1887</td>
                   <td>0.1554</td>
                   <td>0.1591</td>
+                  <td>0.2684</td>
+                  <td>0.0411</td>
                 </tr>
               </tbody>
             </table>
