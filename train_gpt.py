@@ -1844,21 +1844,23 @@ def build_xsa_intervention_suite():
                         layers=layers,
                         token_filter=token_filter,
                     ),
-                    XSAInterventionConfig(
-                        name=f"diag_addback_e{strength_label}_L{layer_label}{filter_suffix}",
-                        kind="diag-addback",
-                        strength=strength,
-                        layers=layers,
-                        token_filter=token_filter,
-                    ),
-                    XSAInterventionConfig(
-                        name=f"context_addback_e{strength_label}_L{layer_label}{filter_suffix}",
-                        kind="context-addback",
-                        strength=strength,
-                        layers=layers,
-                        token_filter=token_filter,
-                    ),
                 ])
+            conditions.extend([
+                XSAInterventionConfig(
+                    name=f"diag_addback_e1_L{layer_label}{filter_suffix}",
+                    kind="diag-addback",
+                    strength=1.0,
+                    layers=layers,
+                    token_filter=token_filter,
+                ),
+                XSAInterventionConfig(
+                    name=f"context_addback_e1_L{layer_label}{filter_suffix}",
+                    kind="context-addback",
+                    strength=1.0,
+                    layers=layers,
+                    token_filter=token_filter,
+                ),
+            ])
             conditions.append(XSAInterventionConfig(
                 name=f"shuffle_proj_g1_L{layer_label}{filter_suffix}",
                 kind="shuffle-proj",
@@ -1918,6 +1920,11 @@ class CausalSelfAttention(nn.Module):
         proj = (y * vn).sum(-1, keepdim=True)
         alpha = torch.tanh(xsa_alpha).type_as(y).view(self.num_heads, 1, 1)
         return y - alpha * proj * vn
+
+    def _record_xsa_alpha_segment(self, reference: Tensor, xsa_alpha: Tensor | None):
+        if xsa_alpha is None:
+            return torch.zeros(self.num_heads, 1, 1, device=reference.device, dtype=reference.dtype)
+        return torch.tanh(xsa_alpha).type_as(reference).view(self.num_heads, 1, 1)
 
     def _intervention_token_mask(self, condition: XSAInterventionConfig, diag: Tensor,
                                  context_proj: Tensor, y_seg: Tensor, v_seg: Tensor):
@@ -1988,10 +1995,12 @@ class CausalSelfAttention(nn.Module):
                 y_mod = y_seg - condition.strength * context_proj
             elif condition.kind == "diag-addback":
                 y_mod = self._apply_record_xsa_segment(y_seg, v_seg, xsa_alpha)
-                y_mod = y_mod + condition.strength * diag_value
+                alpha = self._record_xsa_alpha_segment(y_seg, xsa_alpha)
+                y_mod = y_mod + condition.strength * alpha * diag_value
             elif condition.kind == "context-addback":
                 y_mod = self._apply_record_xsa_segment(y_seg, v_seg, xsa_alpha)
-                y_mod = y_mod + condition.strength * context_proj
+                alpha = self._record_xsa_alpha_segment(y_seg, xsa_alpha)
+                y_mod = y_mod + condition.strength * alpha * context_proj
             elif condition.kind == "shuffle-proj":
                 shuffled_v = torch.roll(v_seg, shifts=args.xsa_intervention_shuffle_shift, dims=1)
                 if length > 1:
