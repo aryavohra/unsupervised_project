@@ -1,0 +1,5 @@
+run,dense_val_points,first_dense_step,first_dense_val,best_step,best_val,best_train_time_s,final_step,final_val,final_train_time_s,final_step_avg_ms
+record-pairedxsa-gate-off-1400-denseval-stop328-20260526,25,1370,3.2881,1394,3.2799,645.62,1394,3.2799,645.62,463.14
+record-xsa-gate-off-1400-denseval-stop328-20260526,1,1400,3.2754,1400,3.2754,631.949,1400,3.2754,631.949,451.39
+record-xsa-gate-off-1400-denseval-stop328-fixedcode-20260526,24,1370,3.2878,1393,3.2799,630.551,1393,3.2799,630.551,452.66
+record-xsa-gate-on-1400-denseval-stop328-20260526,21,1370,3.2874,1390,3.2799,643.201,1390,3.2799,643.201,462.73

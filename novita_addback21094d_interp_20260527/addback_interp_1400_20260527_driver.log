@@ -1,0 +1,92 @@
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libcuda.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libcudadebugger.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-allocator.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-cfg.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-gpucomp.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-ml.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-nvvm.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-opencl.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-pkcs11-openssl3.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-pkcs11.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08 is empty, not checked.
+RUN_START record-xsa-gate-off-1400-addback21094d-interp-20260527 2026-05-27T06:52:05+00:00
+torch 2.10.0+cu126 cuda 12.6 available True
+triton 3.6.0
+RUN_LOG logs/record-xsa-gate-off-1400-addback21094d-interp-20260527.txt
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 11001.45it/s]
+logs/record-xsa-gate-off-1400-addback21094d-interp-20260527.txt
+Loading checkpoint from logs/checkpoints/record-xsa-gate-off-1400-val100-valalign-allinterp-20260527/state_step001400.pt
+Loaded checkpoint step: 1400
+Skipping torch.compile for XSA interpretation run
+Running XSA interp tests ('alignment', 'loss-slices', 'attention-diagnostics', 'beta-diagnostics', 'causal-interventions') for 1 validation batch(es) of 131072 total tokens
+Clamping XSA interp schedule step from checkpoint step 1400 to available schedule step 1385
+Applying final validation window extension for XSA interp
+Using XSA interp mode: record
+Running XSA alignment interp with xsa_mode=record
+/root/xsa_gate_ablation/xsa_interp.py:121: RuntimeWarning: Mean of empty slice
+  ("raw head norm", np.nanmean(data["y_norm"], axis=1), "#404040"),
+/root/xsa_gate_ablation/xsa_interp.py:122: RuntimeWarning: Mean of empty slice
+  ("post-head-XSA norm", np.nanmean(data["y_post_head_xsa_norm"], axis=1), "#ca0020"),
+/root/xsa_gate_ablation/xsa_interp.py:123: RuntimeWarning: Mean of empty slice
+  ("gated head norm", np.nanmean(data["y_gated_norm"], axis=1), "#0571b0"),
+Saved XSA alignment metrics: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_alignment_xsa_geometry.npz
+Saved XSA alignment plot: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_alignment_xsa_geometry.svg
+Running XSA loss-slice interp with xsa_mode=record
+Saved XSA loss-slice metrics: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_loss_slices_xsa_geometry.npz
+Saved XSA loss-slice plot: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_loss_slices_xsa_geometry.svg
+Running XSA attention diagnostics with xsa_mode=record
+/root/xsa_gate_ablation/xsa_interp.py:331: RuntimeWarning: Mean of empty slice
+  ("diag value norm", np.nanmean(data["diag_value_norm"], axis=1), "#ca0020"),
+/root/xsa_gate_ablation/xsa_interp.py:332: RuntimeWarning: Mean of empty slice
+  ("context value norm", np.nanmean(data["context_value_norm"], axis=1), "#0571b0"),
+/root/xsa_gate_ablation/xsa_interp.py:333: RuntimeWarning: Mean of empty slice
+  ("gated norm", np.nanmean(data["gated_norm"], axis=1), "#404040"),
+Saved XSA attention diagnostics metrics: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_attention_attention_diagnostics.npz
+Saved XSA attention diagnostics plot: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_attention_attention_diagnostics.svg
+Running XSA beta diagnostics with xsa_mode=record
+Saved XSA beta diagnostics metrics: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_beta_diagnostics.npz
+Saved XSA beta diagnostics plot: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_beta_diagnostics.svg
+Running XSA causal intervention interp on the trained checkpoint behavior
+Evaluating 52 causal intervention condition(s)
+Saved XSA causal intervention metrics: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_causal_interventions.npz
+Saved XSA causal intervention plot: xsa_interp_logs_addback21094d/record-xsa-gate-off-1400-addback21094d-interp-20260527_causal_interventions.svg
+RUN_DONE record-xsa-gate-off-1400-addback21094d-interp-20260527 2026-05-27T06:52:31+00:00
+RUN_START no-xsa-gate-off-1400-addback21094d-interp-20260527 2026-05-27T06:52:31+00:00
+torch 2.10.0+cu126 cuda 12.6 available True
+triton 3.6.0
+RUN_LOG logs/no-xsa-gate-off-1400-addback21094d-interp-20260527.txt
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 78766.27it/s]
+logs/no-xsa-gate-off-1400-addback21094d-interp-20260527.txt
+Loading checkpoint from logs/checkpoints/no-xsa-gate-off-1400-val100-valalign-allinterp-20260527/state_step001400.pt
+Loaded checkpoint step: 1400
+Skipping torch.compile for XSA interpretation run
+Skipping XSA-dependent interp tests for xsa_mode=none: ('beta-diagnostics', 'causal-interventions')
+Running XSA interp tests ('alignment', 'loss-slices', 'attention-diagnostics') for 1 validation batch(es) of 131072 total tokens
+Clamping XSA interp schedule step from checkpoint step 1400 to available schedule step 1385
+Applying final validation window extension for XSA interp
+Using XSA interp mode: none
+Running XSA alignment interp with xsa_mode=none
+/root/xsa_gate_ablation/xsa_interp.py:121: RuntimeWarning: Mean of empty slice
+  ("raw head norm", np.nanmean(data["y_norm"], axis=1), "#404040"),
+/root/xsa_gate_ablation/xsa_interp.py:122: RuntimeWarning: Mean of empty slice
+  ("post-head-XSA norm", np.nanmean(data["y_post_head_xsa_norm"], axis=1), "#ca0020"),
+/root/xsa_gate_ablation/xsa_interp.py:123: RuntimeWarning: Mean of empty slice
+  ("gated head norm", np.nanmean(data["y_gated_norm"], axis=1), "#0571b0"),
+Saved XSA alignment metrics: xsa_interp_logs_addback21094d/no-xsa-gate-off-1400-addback21094d-interp-20260527_alignment_xsa_geometry.npz
+Saved XSA alignment plot: xsa_interp_logs_addback21094d/no-xsa-gate-off-1400-addback21094d-interp-20260527_alignment_xsa_geometry.svg
+Running XSA loss-slice interp with xsa_mode=none
+Saved XSA loss-slice metrics: xsa_interp_logs_addback21094d/no-xsa-gate-off-1400-addback21094d-interp-20260527_loss_slices_xsa_geometry.npz
+Saved XSA loss-slice plot: xsa_interp_logs_addback21094d/no-xsa-gate-off-1400-addback21094d-interp-20260527_loss_slices_xsa_geometry.svg
+Running XSA attention diagnostics with xsa_mode=none
+/root/xsa_gate_ablation/xsa_interp.py:331: RuntimeWarning: Mean of empty slice
+  ("diag value norm", np.nanmean(data["diag_value_norm"], axis=1), "#ca0020"),
+/root/xsa_gate_ablation/xsa_interp.py:332: RuntimeWarning: Mean of empty slice
+  ("context value norm", np.nanmean(data["context_value_norm"], axis=1), "#0571b0"),
+/root/xsa_gate_ablation/xsa_interp.py:333: RuntimeWarning: Mean of empty slice
+  ("gated norm", np.nanmean(data["gated_norm"], axis=1), "#404040"),
+Saved XSA attention diagnostics metrics: xsa_interp_logs_addback21094d/no-xsa-gate-off-1400-addback21094d-interp-20260527_attention_attention_diagnostics.npz
+Saved XSA attention diagnostics plot: xsa_interp_logs_addback21094d/no-xsa-gate-off-1400-addback21094d-interp-20260527_attention_attention_diagnostics.svg
+RUN_DONE no-xsa-gate-off-1400-addback21094d-interp-20260527 2026-05-27T06:52:50+00:00

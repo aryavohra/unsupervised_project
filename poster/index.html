@@ -204,16 +204,16 @@
               <tbody>
                 <tr>
                   <td><strong>No XSA</strong></td>
-                  <td>0.0594</td>
-                  <td>0.0450</td>
-                  <td>0.1308</td>
+                  <td>0.0589</td>
+                  <td>0.0460</td>
+                  <td>0.1302</td>
                   <td rowspan="2">XSA has much higher alignment with both self-token + self-aligned context (which are then both projected out)</td>
                 </tr>
                 <tr style="background-color: var(--accent-teal-bg);">
                   <td><strong>XSA</strong></td>
-                  <td>0.1824</td>
-                  <td>0.1475</td>
-                  <td>0.1611</td>
+                  <td>0.1887</td>
+                  <td>0.1554</td>
+                  <td>0.1591</td>
                 </tr>
               </tbody>
             </table>
@@ -233,27 +233,27 @@
               <tbody>
                 <tr>
                   <td>No XSA</td>
-                  <td style="text-align: right;"><span class="badge negative">-1.9176</span></td>
+                  <td style="text-align: right;"><span class="badge negative">-1.7249</span></td>
                   <td>XSA adjusts learning dynamics, this is unsurprising.</td>
                 </tr>
                 <tr>
                   <td>Project out random vector (Shuffle value projection)</td>
-                  <td style="text-align: right;"><span class="badge negative">-0.9487</span></td>
+                  <td style="text-align: right;"><span class="badge negative">-0.8621</span></td>
                   <td>Some of the gains from XSA can be attributed to norm modulation, but clearly this doesn't explain everything.</td>
                 </tr>
                 <tr>
                   <td>Force \(a_{ii}\) = 0 (Zero out diagonal mass)</td>
-                  <td style="text-align: right;"><span class="badge minor">-0.2557</span></td>
+                  <td style="text-align: right;"><span class="badge minor">-0.2151</span></td>
                   <td>Eliminating the most explicit attention sink path only decreases loss slightly $\implies$ implicit attention sinking through self-aligned context tokens.</td>
                 </tr>
                 <tr>
                   <td>Add back $v_i$ context post-XSA</td>
-                  <td style="text-align: right;"><span class="badge negative">-1.3348</span></td>
+                  <td style="text-align: right;"><span class="badge negative">-0.5011</span></td>
                   <td>Adding back context-derived $v_i$-parallel components increases loss a lot $\implies$ removal of redundant context seems to be important (a separate improvement of XSA).</td>
                 </tr>
                 <tr>
                   <td>Add back diagonal post-XSA</td>
-                  <td style="text-align: right;"><span class="badge minor">-0.5702</span></td>
+                  <td style="text-align: right;"><span class="badge minor">-0.3702</span></td>
                   <td>Adding back the removed diagonal component post-XSA also hurts, but less so $\implies$ context redundancy removal is more explanatory of XSA's action than attention sink.</td>
                 </tr>
               </tbody>

@@ -588,7 +588,6 @@ def plot_xsa_geometry(npz_path: Path, output_dir: Path, mode_index: int = 0) -> 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("npz", type=Path, nargs="+", help="Path(s) to XSA geometry or validation-alignment npz artifacts.")
-    parser.add_argument("npz", type=Path, nargs="?", help="Path to an *_xsa_geometry.npz artifact.")
     parser.add_argument(
         "-o",
         "--output",
@@ -643,6 +642,9 @@ def main() -> None:
         first_npz = args.npz[0]
         output_dir = args.output or first_npz.with_name(f"{args.stem}_plots")
         outputs, summary = plot_validation_value_alignment(args.npz, output_dir, stem=args.stem)
+    elif args.plot_denseval and not args.npz:
+        outputs = []
+        summary = {}
     else:
         if len(args.npz) != 1:
             raise ValueError("Pass exactly one npz unless --validation-series is set")
@@ -655,17 +657,6 @@ def main() -> None:
         print(f"  {key}: {value:.6f}")
     if args.plot_denseval:
         print(_save_denseval_loss_over_time(args.denseval_gate_off_log, args.denseval_gate_on_log, args.denseval_output))
-
-    if args.npz is not None:
-        output_dir = args.output or args.npz.with_name(f"{args.npz.stem}_plots")
-        outputs, summary = plot_xsa_geometry(args.npz, output_dir, mode_index=args.mode_index)
-        for output in outputs:
-            print(output)
-        print("summary:")
-        for key, value in summary.items():
-            print(f"  {key}: {value:.6f}")
-    elif not args.plot_denseval:
-        raise SystemExit("Provide an NPZ artifact or pass --plot-denseval.")
 
 
 if __name__ == "__main__":
