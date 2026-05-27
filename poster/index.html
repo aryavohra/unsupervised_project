@@ -123,23 +123,23 @@
               <thead>
                 <tr>
                   <th>Method Variant</th>
-                  <th>Val Loss (2k steps)</th>
-                  <th>Steps to 3.28</th>
-                  <th>Speed / Step</th>
+                  <th>Number of Steps</th>
+                  <th>Val Loss</th>
+                  <th>Runtime (secs)</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td><strong>Baseline NanoGPT</strong></td>
-                  <td>3.321</td>
-                  <td>N/A (stuck)</td>
-                  <td>12.4 ms (1.00x)</td>
+                  <td><strong>Previous NanoGPT Record</strong></td>
+                  <td>1440</td>
+                  <td>3.27941</td>
+                  <td>80.400</td>
                 </tr>
                 <tr style="background-color: var(--accent-purple-bg);">
-                  <td><strong>Value Space XSA</strong></td>
-                  <td><strong>3.272</strong></td>
-                  <td><strong>1820 steps</strong></td>
-                  <td>13.1 ms (0.95x)</td>
+                  <td><strong>Value Space XSA New Record</strong></td>
+                  <td><strong>1410</strong></td>
+                  <td><strong>3.27865</strong></td>
+                  <td><strong>79.846</strong></td>
                 </tr>
                 <tr>
                   <td><strong>Residual Space XSA</strong></td>
@@ -176,22 +176,25 @@
                 <tr>
                   <th>Model Setup</th>
                   <th>Self-Attn $a_{ii}$ (Sink)</th>
+                  <th>$y_{\text{diag}}$ Self-Aligned Prop.</th>
                   <th>$y_{\text{ctx}}$ Self-Aligned Prop.</th>
                   <th>Interpretation</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td><strong>Standard (No XSA)</strong></td>
-                  <td>Low (&lt; 0.08)</td>
-                  <td>Low</td>
-                  <td>Wastes context capacity on self-token</td>
+                  <td><strong>Baseline (No XSA)</strong></td>
+                  <td>0.0594</td>
+                  <td>0.0450</td>
+                  <td>0.1308</td>
+                  <td>Wastes context capacity on self-token, and still high attention to self-token</td>
                 </tr>
                 <tr style="background-color: var(--accent-teal-bg);">
-                  <td><strong>XSA (Ours)</strong></td>
-                  <td><strong>High (&gt; 0.42)</strong></td>
-                  <td><strong>High</strong></td>
-                  <td>Discards attention mass cleanly via projection</td>
+                  <td><strong>XSA (Our Improvement)</strong></td>
+                  <td>0.1824</td>
+                  <td>0.1475</td>
+                  <td>0.1611</td>
+                  <td>Much higher attention to self-token (which is projected out)+higher attention on more self-aligned context</td>
                 </tr>
               </tbody>
             </table>
@@ -210,29 +213,29 @@
               </thead>
               <tbody>
                 <tr>
-                  <td><code>no_xsa_all</code> (Disable XSA globally)</td>
-                  <td style="text-align: right;"><span class="badge negative">-1.6383</span></td>
-                  <td>XSA performs a vital, pervasive causal role.</td>
+                  <td>No XSA (Disable XSA globally)</td>
+                  <td style="text-align: right;"><span class="badge negative">-1.9176</span></td>
+                  <td>XSA performs a causal role, changing the model's learning</td>
                 </tr>
                 <tr>
-                  <td><code>shuffle_proj_g1_Lall</code> (Shuffle value projection)</td>
-                  <td style="text-align: right;"><span class="badge negative">-0.9055</span></td>
-                  <td>Removing arbitrary projection dimensions is highly damaging.</td>
+                  <td>Project out random vector (Shuffle value projection)</td>
+                  <td style="text-align: right;"><span class="badge negative">-0.9487</span></td>
+                  <td>Some of the gain is explained by norm modulation, but not the majority.</td>
                 </tr>
                 <tr>
-                  <td><code>force_diag_c0_Lall</code> (Zero out diagonal mass)</td>
-                  <td style="text-align: right;"><span class="badge negative">-0.3693</span></td>
-                  <td>Eliminating diagonal attention mass globally degrades loss.</td>
+                  <td>Force \(a_{ii}\) = 0 (Zero out diagonal mass)</td>
+                  <td style="text-align: right;"><span class="badge minor">-0.2557</span></td>
+                  <td>Eliminating the most explicit attention sink path only decreases loss slightly. Points to other modes of action+implicit attention sink through self-aligned context tokens</td>
                 </tr>
                 <tr>
-                  <td><code>context_addback_e1_Lall</code> (Inject $v_i$ context)</td>
-                  <td style="text-align: right;"><span class="badge negative">-0.9854</span></td>
-                  <td>Adding back context-derived $v_i$-parallel components hurts.</td>
+                  <td>Add back context post-XSA (Inject $v_i$ context)</td>
+                  <td style="text-align: right;"><span class="badge negative">-1.3348</span></td>
+                  <td>Adding back context-derived $v_i$-parallel components increases loss a lot. Removal of redundant context seems to be important (a separate improvement of XSA).</td>
                 </tr>
                 <tr>
-                  <td><code>diag_addback_e0p5_Lall</code> (Add 50% diag value)</td>
-                  <td style="text-align: right;"><span class="badge minor">-0.1069</span></td>
-                  <td>Adding back minor diagonal value mass is tolerated.</td>
+                  <td>Add back diagonal post-XSA</td>
+                  <td style="text-align: right;"><span class="badge minor">-0.5702</span></td>
+                  <td>Adding back the removed diagonal component post-XSA is also important, but less so (Context redundancy removal potentially even more explanatory than attention sink)</td>
                 </tr>
               </tbody>
             </table>
