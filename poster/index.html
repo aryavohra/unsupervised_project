@@ -184,71 +184,77 @@
               </div>
             </div>
             
-            <table>
+            <table class="model-setup-table">
+              <colgroup>
+                <col class="model-col">
+                <col class="sink-col">
+                <col class="align-col">
+                <col class="align-col">
+                <col class="interp-col">
+              </colgroup>
               <thead>
                 <tr>
-                  <th>Model Setup</th>
-                  <th>Self-Attn $a_{ii}$ (Sink)</th>
-                  <th>$y_{\text{diag}}$ Self-Aligned Prop.</th>
-                  <th>$y_{\text{ctx}}$ Self-Aligned Prop.</th>
-                  <th>Interpretation</th>
+                  <th>Model</th>
+                  <th>Self-Attn $a_{ii}$</th>
+                  <th>$y_{\text{diag}}$ aligned frac.</th>
+                  <th>$y_{\text{ctx}}$ aligned frac.</th>
+                  <th>Observation</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td><strong>Baseline (No XSA)</strong></td>
+                  <td><strong>No XSA</strong></td>
                   <td>0.0594</td>
                   <td>0.0450</td>
                   <td>0.1308</td>
-                  <td>Wastes context capacity on self-token, and still high attention to self-token</td>
+                  <td rowspan="2">XSA has much higher alignment with both self-token + self-aligned context (which are then both projected out)</td>
                 </tr>
                 <tr style="background-color: var(--accent-teal-bg);">
-                  <td><strong>XSA (Our Improvement)</strong></td>
+                  <td><strong>XSA</strong></td>
                   <td>0.1824</td>
                   <td>0.1475</td>
                   <td>0.1611</td>
-                  <td>Much higher attention to self-token (which is projected out)+higher attention on more self-aligned context</td>
                 </tr>
               </tbody>
             </table>
 
             <ul>
-              <li><strong>Causal Interventions:</strong> We took a fully-trained XSA model and dynamically perturbed or disabled the XSA projections at evaluation time to evaluate the causal role of the projection mechanisms.</li>
+              <li><strong>Causal Interventions:</strong> We took a fully-trained XSA model and perturbed or disabled the XSA projections at evaluation time to examine the causal mechanisms underlying XSA.</li>
             </ul>
             
             <table>
               <thead>
                 <tr>
-                  <th>Eval-Time Intervention Description</th>
-                  <th style="text-align: right;">Overall \(\Delta \ell\)</th>
-                  <th>Mechanistic Interpretation</th>
+                  <th>Eval-Time Intervention</th>
+                  <th style="text-align: right;">\(\ell_{\text{eval}}-\ell_{\text{intervention}}\)</th>
+                  <th>Interpretation</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td>No XSA (Disable XSA globally)</td>
+                  <td>No XSA</td>
                   <td style="text-align: right;"><span class="badge negative">-1.9176</span></td>
-                  <td>XSA performs a causal role, changing the model's learning</td>
+                  <td>XSA adjusts learning dynamics, this is unsurprising.</td>
                 </tr>
                 <tr>
                   <td>Project out random vector (Shuffle value projection)</td>
                   <td style="text-align: right;"><span class="badge negative">-0.9487</span></td>
-                  <td>Some of the gain is explained by norm modulation, but not the majority.</td>
+                  <td>Some of the gains from XSA can be attributed to norm modulation, but clearly this doesn't explain everything.</td>
                 </tr>
                 <tr>
                   <td>Force \(a_{ii}\) = 0 (Zero out diagonal mass)</td>
                   <td style="text-align: right;"><span class="badge minor">-0.2557</span></td>
-                  <td>Eliminating the most explicit attention sink path only decreases loss slightly. Points to other modes of action+implicit attention sink through self-aligned context tokens</td>
+                  <td>Eliminating the most explicit attention sink path only decreases loss slightly $\implies$ implicit attention sinking through self-aligned context tokens.</td>
                 </tr>
                 <tr>
-                  <td>Add back context post-XSA (Inject $v_i$ context)</td>
+                  <td>Add back $v_i$ context post-XSA</td>
                   <td style="text-align: right;"><span class="badge negative">-1.3348</span></td>
-                  <td>Adding back context-derived $v_i$-parallel components increases loss a lot. Removal of redundant context seems to be important (a separate improvement of XSA).</td>
+                  <td>Adding back context-derived $v_i$-parallel components increases loss a lot $\implies$ removal of redundant context seems to be important (a separate improvement of XSA).</td>
                 </tr>
                 <tr>
                   <td>Add back diagonal post-XSA</td>
                   <td style="text-align: right;"><span class="badge minor">-0.5702</span></td>
-                  <td>Adding back the removed diagonal component post-XSA is also important, but less so (Context redundancy removal potentially even more explanatory than attention sink)</td>
+                  <td>Adding back the removed diagonal component post-XSA also hurts, but less so $\implies$ context redundancy removal is more explanatory of XSA's action than attention sink.</td>
                 </tr>
               </tbody>
             </table>
@@ -258,9 +264,8 @@
           <section>
             <h2 class="section-title">Improving XSA in NanoGPT Speedrun</h2>
             <ul>
-              <li>The record Modded NanoGPT implementation contains a quasi-attention sink called "Sparse Attention Gates".</li>
-              <li>Since we demonstrated that XSA naturally behaves as a robust attention sink, we hypothesized that the Sparse Attention Gates would become completely redundant.</li>
-              <li>Removing these gates and replacing them with XSA resulted in a cleaner architecture that achieves the validation loss target faster.</li>
+              <li>The current Modded-NanoGPT world-record implementation contains a quasi-attention sink called "Sparse Attention Gates".</li>
+              <li>We demonstrated that XSA naturally behaves as an attention sink hence we hypothesized that Sparse Attention Gates are redundant. Removing these yielded a new WR!</li>
             </ul>
             
             <div class="plot-stack">
@@ -275,14 +280,13 @@
             <h2 class="section-title">Conclusions &amp; Future Work</h2>
             <ul>
               <li>
-                <strong>Valuable Inductive Bias:</strong> Confirms the foundational intuition of self-attention as largely a <em>contextual mixing operator</em>. Forcing attention outputs to be orthogonal to the self-value improves general learning efficiency.
+                <strong>Valuable Inductive Bias:</strong> Confirms the intuition of self-attention as a <em>contextual mixing operator</em>. Projecting attention outputs to be orthogonal to the self-value improves sample efficiency.
               </li>
               <li>
-                <strong>Implicit Sinks Work:</strong> Confirms that XSA provides a robust, zero-parameter alternative to explicit attention sinks, naturally absorbing redundant attention mass on diagonal indices.
+                <strong>Implicit Sinks:</strong> Confirms that XSA provides a robust, parameterless alternative to explicit attention sinks. Models learn to place redundant attention mass on diagonal indices and other self-aligned directions.
               </li>
               <li>
-                <strong>Nuanced Scaling Required:</strong> XSA is not a blind drop-in. Layer-selective gating (e.g., lower strengths in initial layers) is key to optimal convergence in deeply stacked architectures.
-              </li>
+                XSA cannot, however, be blindly dropped in. Learning to weight the orthogonal complement projection $\in[0,1]$ yields faster convergence.</li>
             </ul>
           </section>
 
@@ -296,7 +300,7 @@
           <h4>References</h4>
           <ul>
             <li id="ref-zhai">Zhai et al. (2026). "Exclusive Self Attention." <em>arXiv:2601.04932</em>.</li>
-            <li>Modded NanoGPT Speedrun (2024). GitHub Repository: <code>https://github.com/karpathy/llm.c</code></li>
+            <li>Modded NanoGPT Speedrun (2024). GitHub Repository: <code>https://github.com/kellerjordan/modded-nanogpt</code></li>
           </ul>
         </div>
       </footer>

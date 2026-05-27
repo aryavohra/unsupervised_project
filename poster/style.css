@@ -443,6 +443,32 @@ tr:hover td {
   background-color: rgba(238, 242, 246, 0.4);
 }
 
+.model-setup-table .model-col {
+  width: 11%;
+}
+
+.model-setup-table .sink-col {
+  width: 13%;
+}
+
+.model-setup-table .align-col {
+  width: 16%;
+}
+
+.model-setup-table .interp-col {
+  width: 44%;
+}
+
+.model-setup-table th {
+  font-size: 11.5pt;
+  line-height: 1.12;
+  padding: 2.4mm 3mm;
+}
+
+.model-setup-table td {
+  padding: 3mm;
+}
+
 /* Badges and Metrics styling */
 .badge {
   display: inline-block;
