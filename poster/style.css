@@ -233,7 +233,7 @@ h1.poster-title span {
   column-gap: 16mm;
   row-gap: 10mm;
   flex: 1;
-  margin-bottom: 6mm;
+  margin-bottom: 5mm;
 }
 
 .column {
@@ -274,6 +274,14 @@ section.accent-section {
 
 section.accent-section::before {
   background: var(--accent-purple);
+}
+
+.poster-conclusion {
+  margin-bottom: 6mm;
+}
+
+.poster-conclusion ul {
+  gap: 2mm;
 }
 
 h2.section-title {

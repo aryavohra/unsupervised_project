@@ -77,7 +77,7 @@
             </div>
             <ul>
               <li><strong>Core Intuition:</strong> Attention should prioritize modeling <em>contextual information</em> from other tokens, since information about the current token is already accessible through the residual stream and subsequent feedforward network (FFN).</li>
-              <li>XSA also acts as an <strong>implicit attention sink</strong>. By removing the attention component along $v_i$, models can discard attention mass by attending heavily to the self-value. This allows tokens to "attend to nothing" without an explicit sink token.</li>
+              <li>XSA also acts as an <strong>implicit attention sink</strong> (<a href="#ref-xiao">Xiao et al., 2024</a>). By removing the attention component along $v_i$, models can discard attention mass by attending heavily to the self-value. This allows tokens to "attend to nothing" without an explicit sink token.</li>
             </ul>
           </section>
 
@@ -85,7 +85,7 @@
           <section>
             <h2 class="section-title">Existence of the Phenomenon</h2>
             <ul>
-              <li>To observe the phenomenon motivating XSA, we trained an 11-layer GPT-2-style model on FineWeb and analyzed the alignment between attention outputs $y_i$ and self-values $v_i$. We observe consistent, strong $v_i$-alignment across heads and layers.</li>
+              <li>To observe the phenomenon motivating XSA, we trained a NanoGPT speedrun model (an 11-layer GPT-2-style arch.) (<a href="#ref-jordan">Jordan et al., 2024</a>) on FineWeb and analyzed the alignment between attention outputs $y_i$ and self-values $v_i$. We observe consistent, strong $v_i$-alignment across heads and layers.</li>
             </ul>
             
             <div class="plot-row compact-plot-row">
@@ -311,24 +311,25 @@
             </div>
           </section>
 
-          <!-- CONCLUSION -->
-          <section>
-            <h2 class="section-title">Conclusions &amp; Future Work</h2>
-            <ul>
-              <li>
-                <strong>Valuable Inductive Bias:</strong> Confirms the intuition of self-attention as a <em>contextual mixing operator</em>. Projecting attention outputs to be orthogonal to the self-value improves sample efficiency.
-              </li>
-              <li>
-                <strong>Implicit Sinks:</strong> Confirms that XSA provides a robust, parameterless alternative to explicit attention sinks. Models learn to place redundant attention mass on diagonal indices and other self-aligned directions.
-              </li>
-              <li>
-                XSA cannot, however, be blindly dropped in. Learning to weight the orthogonal complement projection $\in[0,1]$ yields faster convergence.</li>
-            </ul>
-          </section>
-
         </div>
 
       </div>
+
+      <!-- FULL-WIDTH CONCLUSION -->
+      <section class="poster-conclusion">
+        <h2 class="section-title">Conclusions &amp; Future Work</h2>
+        <ul>
+          <li>
+            Confirms the intuition of self-attention as a <strong>contextual mixing operator</strong>. Projecting attention outputs to be orthogonal to the self-value improves sample efficiency.
+          </li>
+          <li>
+              Confirms that XSA is an almost-free alternative to explicit <strong>attention sinks</strong>. Models learn to place redundant attention mass on diagonal indices and other self-aligned directions.
+          </li>
+          <li>
+            XSA cannot, however, be blindly dropped in. Learning to weight the orthogonal complement projection $\in[0,1]$ yields faster convergence.
+          </li>
+        </ul>
+      </section>
 
       <!-- FOOTER -->
       <footer>
@@ -337,7 +338,7 @@
           <ul>
             <li id="ref-zhai">Zhai et al. (2026). "Exclusive Self Attention." <em>arXiv:2603.09078</em>.</li>
             <li id="ref-xiao">Xiao et al. (2024). "Efficient Streaming Language Models with Attention Sinks." <em>arXiv:2309.17453</em>.</li>
-            <li>Modded NanoGPT Speedrun (2024). GitHub Repository: <code>https://github.com/kellerjordan/modded-nanogpt</code></li>
+            <li id="ref-jordan">Jordan et al. (2024). "Modded NanoGPT Speedrun."  GitHub Repository: <code>https://github.com/kellerjordan/modded-nanogpt</code></li>
           </ul>
         </div>
       </footer>
