@@ -1,0 +1,36 @@
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libcuda.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libcudadebugger.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-allocator.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-cfg.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-gpucomp.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-ml.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-nvvm.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-opencl.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-pkcs11-openssl3.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-pkcs11.so.580.105.08 is empty, not checked.
+/sbin/ldconfig.real: File /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08 is empty, not checked.
+RUN_START no-xsa-gate-off-1400-force-diag0-alignment-20260527 2026-05-27T07:19:00+00:00
+torch 2.10.0+cu126 cuda 12.6 available True
+triton 3.6.0
+RUN_LOG logs/no-xsa-gate-off-1400-force-diag0-alignment-20260527.txt
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 42048.16it/s]
+logs/no-xsa-gate-off-1400-force-diag0-alignment-20260527.txt
+Loading checkpoint from logs/checkpoints/no-xsa-gate-off-1400-val100-valalign-allinterp-20260527/state_step001400.pt
+Loaded checkpoint step: 1400
+Skipping torch.compile for XSA interpretation run
+Running XSA interp tests ('force-diag-alignment',) for 1 validation batch(es) of 131072 total tokens
+Clamping XSA interp schedule step from checkpoint step 1400 to available schedule step 1385
+Applying final validation window extension for XSA interp
+Using XSA interp mode: record
+Running XSA force-diag alignment diagnostics for 1 condition(s)
+Running XSA alignment interp with intervention=force_diag_c0_Lall_alignment
+/root/xsa_gate_ablation/xsa_interp.py:121: RuntimeWarning: Mean of empty slice
+  ("raw head norm", np.nanmean(data["y_norm"], axis=1), "#404040"),
+/root/xsa_gate_ablation/xsa_interp.py:122: RuntimeWarning: Mean of empty slice
+  ("post-head-XSA norm", np.nanmean(data["y_post_head_xsa_norm"], axis=1), "#ca0020"),
+/root/xsa_gate_ablation/xsa_interp.py:123: RuntimeWarning: Mean of empty slice
+  ("gated head norm", np.nanmean(data["y_gated_norm"], axis=1), "#0571b0"),
+Saved XSA force-diag alignment metrics: xsa_interp_logs_force_diag_alignment/no-xsa-gate-off-1400-force-diag0-alignment-20260527_force_diag_c0_Lall_alignment_xsa_geometry.npz
+Saved XSA force-diag alignment plot: xsa_interp_logs_force_diag_alignment/no-xsa-gate-off-1400-force-diag0-alignment-20260527_force_diag_c0_Lall_alignment_xsa_geometry.svg
+RUN_DONE no-xsa-gate-off-1400-force-diag0-alignment-20260527 2026-05-27T07:19:19+00:00
