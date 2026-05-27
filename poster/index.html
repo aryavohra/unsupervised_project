@@ -61,8 +61,8 @@
           <section>
             <h2 class="section-title">Introduction &amp; Background</h2>
             <ul>
-              <li><strong>Exclusive Self Attention (XSA)</strong> (<a href="#ref-zhai">Zhai et al., 2026</a>) is a novel modification to the self-attention operation in transformer-based LLMs. For each attention head, it orthogonalizes the attention outputs relative to the current token's value vector, removing the component along the self-value direction.</li>
-              <li>For head $h$ at position $i$, standard attention is modified by XSA to project the attention output $y_{h,i}$ onto the orthogonal complement of the self-value vector $v_{h,i}$:</li>
+              <li><strong>Exclusive Self Attention (XSA)</strong> (<a href="#ref-zhai">Zhai et al., 2026</a>) is a modification to the self-attention operation in transformers. For each attention head, it orthogonalizes the attention outputs against the current token's value vector.</li>
+              <li>For head $h$ at position $i$, XSA projects the attention output $y_{h,i}$ onto the orthogonal complement of the self-value vector $v_{h,i}$:</li>
             </ul>
             <div class="equation-block" style="display: flex; justify-content: space-around; align-items: center; width: 100%; gap: 15px; flex-wrap: wrap; text-align: center; padding: 6mm 4mm;">
               <div style="flex: 1; min-width: 200px;">
@@ -76,8 +76,8 @@
               </div>
             </div>
             <ul>
-              <li><strong>Core Intuition:</strong> Attention should prioritize modeling <em>contextual information</em> from other tokens, since information about the current token is already natively preserved through the residual stream and subsequent feedforward networks (FFN).</li>
-              <li>XSA also acts as an <strong>implicit attention sink</strong>. By removing the attention component along $v_i$, models can discard attention mass by attending heavily to the self-value, allowing tokens to "attend to nothing" without requiring an explicit sink token.</li>
+              <li><strong>Core Intuition:</strong> Attention should prioritize modeling <em>contextual information</em> from other tokens, since information about the current token is already accessible through the residual stream and subsequent feedforward network (FFN).</li>
+              <li>XSA also acts as an <strong>implicit attention sink</strong>. By removing the attention component along $v_i$, models can discard attention mass by attending heavily to the self-value. This allows tokens to "attend to nothing" without an explicit sink token.</li>
             </ul>
           </section>
 
@@ -85,8 +85,7 @@
           <section>
             <h2 class="section-title">Existence of the Phenomenon</h2>
             <ul>
-              <li>To confirm the underlying premise of XSA, we trained an 11-layer GPT-2-style model on FineWeb and analyzed the alignment between attention outputs $y_i$ and self-values $v_i$.</li>
-              <li>We observe consistent, strong $v_i$-alignment across heads and layers, demonstrating that standard attention wastes capacity on self-token information.</li>
+              <li>To observe the phenomenon motivating XSA, we trained an 11-layer GPT-2-style model on FineWeb and analyzed the alignment between attention outputs $y_i$ and self-values $v_i$. We observe consistent, strong $v_i$-alignment across heads and layers.</li>
             </ul>
             
             <div class="plot-row compact-plot-row">
@@ -103,21 +102,20 @@
           <section>
             <h2 class="section-title">Training an XSA Model</h2>
             <ul>
-              <li>We explored three distinct structural variations of implementing the XSA orthogonalization principle across different spaces of the Transformer:</li>
+              <li>We implemented 3 approaches to XSA's orthogonalization principle, each w.r.t. a different space</li>
             </ul>
             
             <ul>
               <li>
-                <strong>Value Space (Standard):</strong> Projects $y_{h,i}$ against $v_{h,i}$ on a per-head basis. It is the default implementation, performing well but suffering from slight orthogonalization overhead.
-              </li>
+                <strong>Value Space (author's approach):</strong> Projects $y_{h,i}$ against $v_{h,i}$ on a per-head basis.</li>
               <li>
-                <strong>Residual Space:</strong> Projects the post-$W_o$ final attention output $o_i$ directly against the residual token representation $x_i$:
+                <strong>Residual Space:</strong> Projects the post-$W_o$ final attention output $o_i$ against the residual token representation $x_i$:
                 <div class="equation-block">
                   $$o_i'= o_i-\frac{o_i^\top x_i}{\|x_i\|^2}x_i$$
                 </div>
               </li>
               <li>
-                <strong>Model Space (Diag):</strong> Projects $o_i$ against the combined subspace span of all head self-values in the model space. Let $u_{h,i}=W_o^{(h)}v_{h,i}$, $U_i=\operatorname{orth}(u_{1,i},\ldots,u_{H,i})$, and:
+                <strong>Model Space:</strong> Projects $o_i$ against the combined subspace span of all head self-values in the model space. Let $u_{h,i}=W_o^{(h)}v_{h,i}$, $U_i=\operatorname{orth}(u_{1,i},\ldots,u_{H,i})$, and:
                 <div class="equation-block">
                   $$o_i'=(I- U_iU_i^\top)o_i$$
                 </div>
@@ -174,7 +172,7 @@
           <section>
             <h2 class="section-title">Mechanistic Interpretability &amp; Interventions</h2>
             <ul>
-              <li><strong>Sinking Hypothesis:</strong> Does the model learn that self-attention components are actively discarded? We observed that XSA models allocate significantly <em>higher</em> attention mass towards the self-token, validating that it acts as an implicit, low-overhead sink.</li>
+              <li><strong>Sinking Hypothesis:</strong> We observed that XSA models allocate significantly <em>higher</em> attention mass towards the self-token, validating that it acts as an implicit sink.</li>
             </ul>
 
             <div class="plot-stack">
