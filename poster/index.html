@@ -152,7 +152,7 @@
                   <td>?</td>
                 </tr>
                 <tr>
-                  <td><strong>Model Space XSA</strong></td>
+                  <td><strong>Model Space XSA (Approximation using Metric Diag)</strong></td>
                   <td>?</td>
                   <td>?</td>
                   <td>?</td>
@@ -261,12 +261,12 @@
                 <tr>
                   <td>Add back $v_i$ context post-XSA</td>
                   <td style="text-align: right;"><span class="badge negative">-0.5011</span></td>
-                  <td>Adding back context-derived $v_i$-parallel components increases loss a lot $\implies$ removal of redundant context seems to be important (a separate improvement of XSA).</td>
+                  <td>Adding back context-derived $v_i$-parallel components increases loss $\implies$ removal of redundant context+attention sinking on context seems to be important.</td>
                 </tr>
                 <tr>
                   <td>Add back diagonal post-XSA</td>
                   <td style="text-align: right;"><span class="badge minor">-0.3702</span></td>
-                  <td>Adding back the removed diagonal component post-XSA also hurts, but less so $\implies$ context redundancy removal is more explanatory of XSA's action than attention sink.</td>
+                  <td>Adding back the removed diagonal component post-XSA also harmful, but less so $\implies$ effect of XSA through context tokens stronger than through diagonal.</td>
                 </tr>
               </tbody>
             </table>
