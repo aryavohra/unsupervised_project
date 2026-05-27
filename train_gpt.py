@@ -2779,15 +2779,12 @@ class Hyperparameters:
     xsa_interp: bool = os.environ.get("XSA_INTERP", "0").lower() in ("1", "true", "yes")
     post_train_xsa_interp: bool = os.environ.get("POST_TRAIN_XSA_INTERP", "0").lower() in ("1", "true", "yes")
     xsa_interp_tests: tuple[str, ...] = tuple(s for s in os.environ.get("XSA_INTERP_TESTS", "alignment").replace(",", " ").split())
-    xsa_interp_modes: tuple[str, ...] = tuple(s.replace("_", "-") for s in os.environ.get(
-        "XSA_INTERP_MODES",
-        "record none value output-metric-diag",
-    ).replace(",", " ").split())
     xsa_interp_batches: int = int(os.environ.get("XSA_INTERP_BATCHES", "1"))
     xsa_interp_batch_size: int = int(os.environ.get("XSA_INTERP_BATCH_SIZE", str(8 * 2048 * world_size * grad_accum_steps)))
     xsa_interp_dir: str = os.environ.get("XSA_INTERP_DIR", "xsa_interp_logs")
     xsa_interp_step: int | None = int(os.environ["XSA_INTERP_STEP"]) if "XSA_INTERP_STEP" in os.environ else None
     xsa_interp_final_ws: bool = os.environ.get("XSA_INTERP_FINAL_WS", "1").lower() in ("1", "true", "yes")
+    xsa_val_alignment: bool = os.environ.get("XSA_VAL_ALIGNMENT", "0").lower() in ("1", "true", "yes")
     val_every_after_step: int | None = int(os.environ["VAL_EVERY_AFTER_STEP"]) if "VAL_EVERY_AFTER_STEP" in os.environ else None
     stop_val_loss_below: float | None = float(os.environ["STOP_VAL_LOSS_BELOW"]) if "STOP_VAL_LOSS_BELOW" in os.environ else None
     xsa_intervention_layers: tuple[str, ...] = tuple(
@@ -2859,9 +2856,7 @@ def apply_cli_overrides(args: Hyperparameters):
     parser.add_argument("--post-train-xsa-interp", nargs="?", const=True, default=None, type=bool_arg,
                         help="Run XSA interpretation after the training loop finishes, without requiring a checkpoint reload.")
     parser.add_argument("--xsa-interp-tests", default=None,
-                        help="Comma- or space-separated interp tests to run. Supported: alignment, loss-slices, attention-diagnostics.")
-    parser.add_argument("--xsa-interp-modes", default=None,
-                        help="Comma- or space-separated XSA modes to sweep. For loss-slices, the first mode is the baseline.")
+                        help="Comma- or space-separated interp tests to run, or 'all'.")
     parser.add_argument("--xsa-interp-batches", type=int, default=None,
                         help="Number of validation batches to use for XSA geometry interpretation.")
     parser.add_argument("--xsa-interp-batch-size", type=int, default=None,
@@ -2872,6 +2867,10 @@ def apply_cli_overrides(args: Hyperparameters):
                         help="Schedule step to use for XSA interp. Defaults to loaded checkpoint step when available, else 0.")
     parser.add_argument("--xsa-interp-final-ws", nargs="?", const=True, default=None, type=bool_arg,
                         help="Use final validation window extension during XSA interp.")
+    parser.add_argument("--xsa-val-alignment", dest="xsa_val_alignment", action="store_true", default=None,
+                        help="Record XSA alignment geometry on the same batches used for each validation pass.")
+    parser.add_argument("--no-xsa-val-alignment", dest="xsa_val_alignment", action="store_false",
+                        help="Do not record XSA alignment geometry during validation.")
     parser.add_argument("--val-every-after-step", type=int, default=None,
                         help="Run validation at every step starting from this step, in addition to the normal cadence.")
     parser.add_argument("--stop-val-loss-below", type=float, default=None,
@@ -2936,8 +2935,14 @@ def apply_cli_overrides(args: Hyperparameters):
         args.post_train_xsa_interp = cli_args.post_train_xsa_interp
     if cli_args.xsa_interp_tests is not None:
         args.xsa_interp_tests = tuple(s for s in cli_args.xsa_interp_tests.replace(",", " ").split())
-    if cli_args.xsa_interp_modes is not None:
-        args.xsa_interp_modes = tuple(s.replace("_", "-") for s in cli_args.xsa_interp_modes.replace(",", " ").split())
+    if args.xsa_interp_tests == ("all",):
+        args.xsa_interp_tests = (
+            "alignment",
+            "loss-slices",
+            "attention-diagnostics",
+            "beta-diagnostics",
+            "causal-interventions",
+        )
     if cli_args.xsa_interp_batches is not None:
         args.xsa_interp_batches = cli_args.xsa_interp_batches
     if cli_args.xsa_interp_batch_size is not None:
@@ -2948,6 +2953,8 @@ def apply_cli_overrides(args: Hyperparameters):
         args.xsa_interp_step = cli_args.xsa_interp_step
     if cli_args.xsa_interp_final_ws is not None:
         args.xsa_interp_final_ws = cli_args.xsa_interp_final_ws
+    if cli_args.xsa_val_alignment is not None:
+        args.xsa_val_alignment = cli_args.xsa_val_alignment
     if cli_args.val_every_after_step is not None:
         args.val_every_after_step = cli_args.val_every_after_step
     if cli_args.stop_val_loss_below is not None:
@@ -2968,16 +2975,13 @@ def apply_cli_overrides(args: Hyperparameters):
     supported_xsa_modes = ("record", "none", "value", "output-metric-diag", "substoch", "substoch-delta")
     if args.xsa_mode not in supported_xsa_modes:
         raise ValueError(f"Unsupported XSA_MODE={args.xsa_mode!r}")
-    unsupported_interp_modes = tuple(mode for mode in args.xsa_interp_modes if mode not in supported_xsa_modes)
-    if unsupported_interp_modes:
-        raise ValueError(f"Unsupported XSA_INTERP_MODES entries: {unsupported_interp_modes}")
     unsupported_interp_tests = tuple(test for test in args.xsa_interp_tests if test not in ("alignment", "loss-slices", "attention-diagnostics", "causal-interventions", "beta-diagnostics"))
     if unsupported_interp_tests:
         raise ValueError(f"Unsupported XSA_INTERP_TESTS entries: {unsupported_interp_tests}")
     if args.xsa_interp and not args.xsa_interp_tests:
         raise ValueError("XSA_INTERP_TESTS must include at least one test when XSA_INTERP is enabled")
-    if args.xsa_interp and any(test in args.xsa_interp_tests for test in ("alignment", "loss-slices", "attention-diagnostics")) and not args.xsa_interp_modes:
-        raise ValueError("XSA_INTERP_MODES must include at least one mode when alignment, loss-slices, or attention-diagnostics interp is enabled")
+    if args.xsa_val_alignment and args.skip_validation:
+        raise ValueError("--xsa-val-alignment requires validation; remove --skip-validation")
     unsupported_token_filters = tuple(
         token_filter for token_filter in args.xsa_intervention_token_filters
         if token_filter not in ("all", "high-self", "high-context", "high-aligned")
@@ -3370,12 +3374,18 @@ print0(f"XSA disable layers: {args.xsa_disable_layers}")
 print0(f"XSA interp: {args.xsa_interp}")
 print0(f"Post-train XSA interp: {args.post_train_xsa_interp}")
 print0(f"XSA interp tests: {args.xsa_interp_tests}")
-print0(f"XSA interp modes: {args.xsa_interp_modes}")
 print0(f"XSA interp batches: {args.xsa_interp_batches}")
 print0(f"XSA interp batch size: {args.xsa_interp_batch_size}")
 print0(f"XSA interp dir: {args.xsa_interp_dir}")
 print0(f"XSA interp step: {args.xsa_interp_step}")
 print0(f"XSA interp final ws: {args.xsa_interp_final_ws}")
+print0(f"XSA val alignment: {args.xsa_val_alignment}")
+print0(f"XSA intervention layers: {args.xsa_intervention_layers}")
+print0(f"XSA intervention strengths: {args.xsa_intervention_strengths}")
+print0(f"XSA intervention diag masses: {args.xsa_intervention_diag_masses}")
+print0(f"XSA intervention token filters: {args.xsa_intervention_token_filters}")
+print0(f"XSA intervention quantile: {args.xsa_intervention_quantile}")
+print0(f"XSA intervention shuffle shift: {args.xsa_intervention_shuffle_shift}")
 print0(f"Val every after step: {args.val_every_after_step}")
 print0(f"Stop val loss below: {args.stop_val_loss_below}")
 
@@ -3467,16 +3477,66 @@ if loaded_checkpoint is not None:
 completed_train_step: int | None = None
 
 
+def active_xsa_interp_tests(print_fn) -> tuple[str, ...]:
+    tests = list(args.xsa_interp_tests)
+    if args.xsa_mode == "none":
+        record_only_tests = {"beta-diagnostics", "causal-interventions"}
+        skipped = tuple(test for test in tests if test in record_only_tests)
+        tests = [test for test in tests if test not in record_only_tests]
+        if skipped:
+            print_fn(
+                f"Skipping XSA-dependent interp tests for xsa_mode=none: {skipped}",
+                console=True,
+            )
+    return tuple(tests)
+
+
+def save_validation_xsa_alignment(data: dict, step: int, train_steps: int):
+    os.makedirs(args.xsa_interp_dir, exist_ok=True)
+    data["interp_test"] = np.array("validation-alignment")
+    data["xsa_mode"] = np.array(args.xsa_mode)
+    data["validation_step"] = np.array(step)
+    data["train_steps"] = np.array(train_steps)
+    data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
+    data["output_metric_detach"] = np.array(args.output_metric_detach)
+    data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+    data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
+    filename = f"{args.run_id}_val_step{step:06d}_xsa_alignment.npz"
+    path = os.path.join(args.xsa_interp_dir, filename)
+    np.savez(path, **data)
+    return path
+
+
+def validation_xsa_alignment_summary(data: dict):
+    def mean(name):
+        values = data[name]
+        return float(np.nanmean(values)) if np.isfinite(values).any() else float("nan")
+
+    return dict(
+        cos_y_v=mean("cos_y_v"),
+        cos_y_post_v=mean("cos_y_post_v"),
+        removed_frac_value=mean("removed_frac_value"),
+        removed_frac_value_post=mean("removed_frac_value_post"),
+        resid_frac_post=mean("resid_frac_post"),
+        model_span_frac_post=mean("model_span_frac_post"),
+    )
+
+
 def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn):
     global xsa_interp_active
     global xsa_interp_recorder, xsa_attention_diag_recorder, xsa_beta_diag_recorder, xsa_intervention_config
     original_xsa_mode = args.xsa_mode
     xsa_interp_active = True
+    interp_tests = active_xsa_interp_tests(print_fn)
     print_fn(
-        f"Running XSA interp tests {args.xsa_interp_tests} for {args.xsa_interp_batches} validation batch(es) "
+        f"Running XSA interp tests {interp_tests} for {args.xsa_interp_batches} validation batch(es) "
         f"of {args.xsa_interp_batch_size} total tokens",
         console=True,
     )
+    if not interp_tests:
+        print_fn(f"No XSA interp tests apply for xsa_mode={args.xsa_mode}; skipping interp", console=True)
+        xsa_interp_active = False
+        return
     interp_step = args.xsa_interp_step
     if interp_step is None:
         interp_step = (
@@ -3497,57 +3557,47 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
         print_fn("Applying final validation window extension for XSA interp", console=True)
         training_manager.apply_final_ws_ext()
     model.eval()
-    alignment_results = []
+    interp_mode = args.xsa_mode
+    print_fn(f"Using XSA interp mode: {interp_mode}", console=True)
 
     try:
-        if "alignment" in args.xsa_interp_tests:
-            for mode in args.xsa_interp_modes:
-                args.xsa_mode = mode
-                print_fn(f"Running XSA alignment interp with xsa_mode={mode}", console=True)
-                xsa_interp_recorder = XSAInterpRecorder(num_layers=11, num_heads=6, head_dim=128)
-                val_loader = distributed_data_generator(
-                    args.val_files,
-                    args.xsa_interp_batch_size,
-                    -1,
-                    grad_accum_steps=grad_accum_steps,
-                    align_to_bos=False,
-                )
-                with torch.no_grad():
-                    for _ in range(args.xsa_interp_batches):
-                        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-                del val_loader
-                xsa_interp_recorder.sync_distributed()
-                data = xsa_interp_recorder.as_numpy()
-                data["interp_test"] = np.array("alignment")
-                data["xsa_mode"] = np.array(mode)
-                data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
-                data["output_metric_detach"] = np.array(args.output_metric_detach)
-                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
-                data["xsa_interp_schedule_step"] = np.array(schedule_step)
-                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
-                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
-                xsa_interp_recorder = None
-                alignment_results.append(data)
-                if master_process:
-                    from xsa_interp import save_xsa_interp_outputs
-
-                    mode_run_id = f"{args.run_id}_alignment_{mode.replace('-', '_')}"
-                    npz_path, svg_path = save_xsa_interp_outputs(data, args.xsa_interp_dir, mode_run_id)
-                    print_fn(f"Saved XSA alignment metrics for {mode}: {npz_path}", console=True)
-                    print_fn(f"Saved XSA alignment plot for {mode}: {svg_path}", console=True)
-
+        if "alignment" in interp_tests:
+            print_fn(f"Running XSA alignment interp with xsa_mode={interp_mode}", console=True)
+            xsa_interp_recorder = XSAInterpRecorder(num_layers=11, num_heads=6, head_dim=128)
+            val_loader = distributed_data_generator(
+                args.val_files,
+                args.xsa_interp_batch_size,
+                -1,
+                grad_accum_steps=grad_accum_steps,
+                align_to_bos=False,
+            )
+            with torch.no_grad():
+                for _ in range(args.xsa_interp_batches):
+                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                    model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+            del val_loader
+            xsa_interp_recorder.sync_distributed()
+            data = xsa_interp_recorder.as_numpy()
+            data["interp_test"] = np.array("alignment")
+            data["xsa_mode"] = np.array(interp_mode)
+            data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
+            data["output_metric_detach"] = np.array(args.output_metric_detach)
+            data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+            data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
+            data["xsa_interp_schedule_step"] = np.array(schedule_step)
+            data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+            data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+            xsa_interp_recorder = None
             if master_process:
-                from xsa_interp import save_xsa_alignment_sweep_outputs
+                from xsa_interp import save_xsa_interp_outputs
 
-                npz_path, svg_path = save_xsa_alignment_sweep_outputs(alignment_results, args.xsa_interp_dir, args.run_id)
-                print_fn(f"Saved XSA alignment sweep metrics: {npz_path}", console=True)
-                print_fn(f"Saved XSA alignment sweep plot: {svg_path}", console=True)
+                npz_path, svg_path = save_xsa_interp_outputs(data, args.xsa_interp_dir, f"{args.run_id}_alignment")
+                print_fn(f"Saved XSA alignment metrics: {npz_path}", console=True)
+                print_fn(f"Saved XSA alignment plot: {svg_path}", console=True)
 
-        if "loss-slices" in args.xsa_interp_tests:
+        if "loss-slices" in interp_tests:
             print_fn(
-                f"Running XSA loss-slice interp with baseline xsa_mode={args.xsa_interp_modes[0]}",
+                f"Running XSA loss-slice interp with xsa_mode={interp_mode}",
                 console=True,
             )
             token_class_masks = _build_token_class_masks(model.vocab_size)
@@ -3571,22 +3621,21 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                     )
                     if loss_slice_recorder is None:
                         loss_slice_recorder = XSALossSliceRecorder(
-                            args.xsa_interp_modes,
+                            (interp_mode,),
                             [name for name, _ in bucket_masks],
                         )
                     losses_by_mode = []
-                    for mode in args.xsa_interp_modes:
-                        args.xsa_mode = mode
-                        losses_by_mode.append(
-                            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).detach()
-                        )
+                    args.xsa_mode = interp_mode
+                    losses_by_mode.append(
+                        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).detach()
+                    )
                     loss_slice_recorder.record(losses_by_mode, bucket_masks)
             del val_loader
             if loss_slice_recorder is not None:
                 loss_slice_recorder.sync_distributed()
                 data = loss_slice_recorder.as_numpy()
                 data["interp_test"] = np.array("loss-slices")
-                data["baseline_xsa_mode"] = np.array(args.xsa_interp_modes[0])
+                data["baseline_xsa_mode"] = np.array(interp_mode)
                 data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
                 data["output_metric_detach"] = np.array(args.output_metric_detach)
                 data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
@@ -3601,53 +3650,42 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                     print_fn(f"Saved XSA loss-slice metrics: {npz_path}", console=True)
                     print_fn(f"Saved XSA loss-slice plot: {svg_path}", console=True)
 
-        if "attention-diagnostics" in args.xsa_interp_tests:
-            attention_results = []
-            for mode in args.xsa_interp_modes:
-                args.xsa_mode = mode
-                print_fn(f"Running XSA attention diagnostics with xsa_mode={mode}", console=True)
-                xsa_attention_diag_recorder = XSAAttentionDiagRecorder(num_layers=11, num_heads=6)
-                val_loader = distributed_data_generator(
-                    args.val_files,
-                    args.xsa_interp_batch_size,
-                    -1,
-                    grad_accum_steps=grad_accum_steps,
-                    align_to_bos=False,
-                )
-                with torch.no_grad():
-                    for _ in range(args.xsa_interp_batches):
-                        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
-                        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
-                del val_loader
-                xsa_attention_diag_recorder.sync_distributed()
-                data = xsa_attention_diag_recorder.as_numpy()
-                data["interp_test"] = np.array("attention-diagnostics")
-                data["xsa_mode"] = np.array(mode)
-                data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
-                data["output_metric_detach"] = np.array(args.output_metric_detach)
-                data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
-                data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
-                data["xsa_interp_schedule_step"] = np.array(schedule_step)
-                data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
-                data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
-                xsa_attention_diag_recorder = None
-                attention_results.append(data)
-                if master_process:
-                    from xsa_interp import save_xsa_attention_diag_outputs
-
-                    mode_run_id = f"{args.run_id}_attention_{mode.replace('-', '_')}"
-                    npz_path, svg_path = save_xsa_attention_diag_outputs(data, args.xsa_interp_dir, mode_run_id)
-                    print_fn(f"Saved XSA attention diagnostics for {mode}: {npz_path}", console=True)
-                    print_fn(f"Saved XSA attention diagnostics plot for {mode}: {svg_path}", console=True)
-
+        if "attention-diagnostics" in interp_tests:
+            args.xsa_mode = interp_mode
+            print_fn(f"Running XSA attention diagnostics with xsa_mode={interp_mode}", console=True)
+            xsa_attention_diag_recorder = XSAAttentionDiagRecorder(num_layers=11, num_heads=6)
+            val_loader = distributed_data_generator(
+                args.val_files,
+                args.xsa_interp_batch_size,
+                -1,
+                grad_accum_steps=grad_accum_steps,
+                align_to_bos=False,
+            )
+            with torch.no_grad():
+                for _ in range(args.xsa_interp_batches):
+                    inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+                    model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+            del val_loader
+            xsa_attention_diag_recorder.sync_distributed()
+            data = xsa_attention_diag_recorder.as_numpy()
+            data["interp_test"] = np.array("attention-diagnostics")
+            data["xsa_mode"] = np.array(interp_mode)
+            data["model_xsa_lambda"] = np.array(args.model_xsa_lambda)
+            data["output_metric_detach"] = np.array(args.output_metric_detach)
+            data["checkpoint_step"] = np.array(loaded_checkpoint_step if loaded_checkpoint_step is not None else -1)
+            data["completed_train_step"] = np.array(completed_train_step if completed_train_step is not None else -1)
+            data["xsa_interp_schedule_step"] = np.array(schedule_step)
+            data["xsa_interp_batches"] = np.array(args.xsa_interp_batches)
+            data["xsa_interp_batch_size"] = np.array(args.xsa_interp_batch_size)
+            xsa_attention_diag_recorder = None
             if master_process:
-                from xsa_interp import save_xsa_attention_diag_sweep_outputs
+                from xsa_interp import save_xsa_attention_diag_outputs
 
-                npz_path, svg_path = save_xsa_attention_diag_sweep_outputs(attention_results, args.xsa_interp_dir, args.run_id)
-                print_fn(f"Saved XSA attention diagnostics sweep metrics: {npz_path}", console=True)
-                print_fn(f"Saved XSA attention diagnostics sweep plot: {svg_path}", console=True)
+                npz_path, svg_path = save_xsa_attention_diag_outputs(data, args.xsa_interp_dir, f"{args.run_id}_attention")
+                print_fn(f"Saved XSA attention diagnostics metrics: {npz_path}", console=True)
+                print_fn(f"Saved XSA attention diagnostics plot: {svg_path}", console=True)
 
-        if "beta-diagnostics" in args.xsa_interp_tests:
+        if "beta-diagnostics" in interp_tests:
             print_fn("Running XSA beta diagnostics with xsa_mode=record", console=True)
             args.xsa_mode = "record"
             token_class_masks = _build_token_class_masks(model.vocab_size)
@@ -3697,7 +3735,7 @@ def run_xsa_interp(model: nn.Module, training_manager: TrainingManager, print_fn
                     print_fn(f"Saved XSA beta diagnostics metrics: {npz_path}", console=True)
                     print_fn(f"Saved XSA beta diagnostics plot: {svg_path}", console=True)
 
-        if "causal-interventions" in args.xsa_interp_tests:
+        if "causal-interventions" in interp_tests:
             print_fn("Running XSA causal intervention interp on the trained checkpoint behavior", console=True)
             conditions = build_xsa_intervention_suite()
             condition_names = xsa_intervention_condition_names(conditions)
@@ -3867,6 +3905,8 @@ for step in range(resume_step, train_steps + 1):
         or (args.val_every_after_step is not None and step >= args.val_every_after_step)
     )
     if (not args.skip_validation) and validate_this_step:
+        validation_xsa_path = None
+        validation_xsa_summary = None
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
@@ -3878,14 +3918,38 @@ for step in range(resume_step, train_steps + 1):
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
+            if args.xsa_val_alignment:
+                xsa_interp_recorder = XSAInterpRecorder(num_layers=11, num_heads=6, head_dim=128)
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
         val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+        if args.xsa_val_alignment:
+            xsa_interp_recorder.sync_distributed()
+            validation_xsa_data = xsa_interp_recorder.as_numpy()
+            xsa_interp_recorder = None
+            validation_xsa_summary = validation_xsa_alignment_summary(validation_xsa_data)
+            if master_process:
+                validation_xsa_path = save_validation_xsa_alignment(validation_xsa_data, step, train_steps)
         completed_since_start = max(step - resume_step, 1)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/completed_since_start:.2f}ms", console=True)
+        if validation_xsa_summary is not None:
+            print0(
+                "xsa_val_alignment "
+                f"step:{step}/{train_steps} "
+                f"xsa_mode:{args.xsa_mode} "
+                f"disable_attn_gate:{args.disable_attn_gate} "
+                f"cos_y_v:{validation_xsa_summary['cos_y_v']:.6f} "
+                f"cos_y_post_v:{validation_xsa_summary['cos_y_post_v']:.6f} "
+                f"removed_frac_value:{validation_xsa_summary['removed_frac_value']:.6f} "
+                f"removed_frac_value_post:{validation_xsa_summary['removed_frac_value_post']:.6f} "
+                f"resid_frac_post:{validation_xsa_summary['resid_frac_post']:.6f} "
+                f"model_span_frac_post:{validation_xsa_summary['model_span_frac_post']:.6f} "
+                f"path:{validation_xsa_path}",
+                console=True,
+            )
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -3952,6 +4016,7 @@ for step in range(resume_step, train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    train_loss = torch.zeros((), device=device)
     for idx in range(grad_accum_steps):
         (inputs, targets, cum_seqlens, bigram_inputs, bigram_cpu), train_loader_started = next_data_batch(
             train_loader,
@@ -3959,16 +4024,20 @@ for step in range(resume_step, train_steps + 1):
             train_loader_started,
         )
         training_manager.sparse_index_update(step, bigram_cpu)
-        loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).sum() * grad_scale
+        loss_per_token = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        train_loss += loss_per_token.detach().mean()
+        loss = loss_per_token.sum() * grad_scale
         training_manager.sparse_index_share(step)
         loss.backward()
-        del loss
+        del loss, loss_per_token
     training_manager.step_optimizers(step)
+    train_loss /= grad_accum_steps
+    dist.reduce(train_loss, 0, op=dist.ReduceOp.AVG)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     completed_since_start = step + 1 - resume_step
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/completed_since_start:.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/completed_since_start:.2f}ms", console=True)
 
 completed_train_step = train_steps
 
