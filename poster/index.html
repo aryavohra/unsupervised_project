@@ -117,7 +117,36 @@
               <li>
                 <strong>Model Space:</strong> Projects $o_i$ against the combined subspace span of all head self-values in the model space. Let $u_{h,i}=W_o^{(h)}v_{h,i}$, $U_i=\operatorname{orth}(u_{1,i},\ldots,u_{H,i})$, and:
                 <div class="equation-block">
-                  $$o_i'=(I- U_iU_i^\top)o_i$$
+                  $$
+                  \begin{aligned}
+                  \underbrace{o_i'}_{\mathbb{R}^{768}}
+                  &=
+                  \left(
+                    I
+                    -
+                    \underbrace{U_i}_{\mathbb{R}^{768\times 6}}
+                    \underbrace{U_i^\top}_{\mathbb{R}^{6\times 768}}
+                  \right)
+                  \underbrace{o_i}_{\mathbb{R}^{768}},\\[1mm]
+                  M_h
+                  &=
+                  \operatorname{diag}\!\left(
+                    (W_o^{(h)})^\top W_o^{(h)}
+                  \right);
+                  \overbrace{W_o^{(h)}}^{\mathbb{R}^{768\times 128}},\\[1mm]
+                  \underbrace{z_{h,i}}_{\mathbb{R}^{128}}
+                  &=
+                  \underbrace{y_{h,i}}_{\mathbb{R}^{128}}
+                  -
+                  \alpha_h
+                  \frac{
+                    y_{h,i}^{\top} M_h v_{h,i}
+                  }{
+                    v_{h,i}^{\top} M_h v_{h,i}
+                  }
+                  \underbrace{v_{h,i}}_{\mathbb{R}^{128}}
+                  \end{aligned}
+                  $$
                 </div>
               </li>
             </ul>
@@ -306,7 +335,8 @@
         <div class="footer-refs">
           <h4>References</h4>
           <ul>
-            <li id="ref-zhai">Zhai et al. (2026). "Exclusive Self Attention." <em>arXiv:2601.04932</em>.</li>
+            <li id="ref-zhai">Zhai et al. (2026). "Exclusive Self Attention." <em>arXiv:2603.09078</em>.</li>
+            <li id="ref-xiao">Xiao et al. (2024). "Efficient Streaming Language Models with Attention Sinks." <em>arXiv:2309.17453</em>.</li>
             <li>Modded NanoGPT Speedrun (2024). GitHub Repository: <code>https://github.com/kellerjordan/modded-nanogpt</code></li>
           </ul>
         </div>
