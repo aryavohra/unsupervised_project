@@ -32,6 +32,10 @@ def _filtered_layers(values: np.ndarray) -> tuple[np.ndarray, list[int]]:
     return values[mask], layers
 
 
+def _unpaired_rows(layers: list[int]) -> list[int]:
+    return [idx for idx, layer in enumerate(layers) if layer not in PAIRED_LAYERS]
+
+
 def _load_metric(data: np.lib.npyio.NpzFile, name: str, mode_index: int) -> np.ndarray:
     if name not in data:
         raise KeyError(f"Missing required metric {name!r} in {data.files}")
@@ -120,7 +124,7 @@ def _save_heatmap(
 
 
 def _save_value_fraction_line(values: np.ndarray, layers: list[int], output_path: Path) -> None:
-    unpaired_rows = [idx for idx, layer in enumerate(layers) if layer not in PAIRED_LAYERS]
+    unpaired_rows = _unpaired_rows(layers)
     unpaired_layers = [layers[idx] for idx in unpaired_rows]
     unpaired_values = values[unpaired_rows]
     unpaired_index = np.arange(len(unpaired_layers))
@@ -166,10 +170,17 @@ def plot_xsa_geometry(npz_path: Path, output_dir: Path, mode_index: int = 0) -> 
         outputs[2],
     )
     _save_value_fraction_line(removed_value_avg[:, 0], layers, outputs[3])
+    summary_rows = _unpaired_rows(layers)
     summary = {
-        "mean_value_space_fraction_removed_across_heads": float(np.nanmean(removed_value)),
-        "mean_model_space_fraction_removed_across_heads": float(np.nanmean(model_span_removed_by_head)),
-        "mean_model_space_fraction_removed_by_layer": float(np.nanmean(model_span_removed)),
+        "mean_value_space_fraction_removed_unpaired_layers_across_heads": float(
+            np.nanmean(removed_value[summary_rows])
+        ),
+        "mean_model_space_fraction_removed_unpaired_layers_across_heads": float(
+            np.nanmean(model_span_removed_by_head[summary_rows])
+        ),
+        "mean_model_space_fraction_removed_unpaired_layers_by_layer": float(
+            np.nanmean(model_span_removed[summary_rows])
+        ),
     }
     return outputs, summary
 
